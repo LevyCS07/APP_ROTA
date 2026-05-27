@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: roteamento-backend
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: BAIRROS_GEOJSON_PATH
+        value: app/data/BAIRROS_MANAUS.geojson
+      - key: ORS_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
