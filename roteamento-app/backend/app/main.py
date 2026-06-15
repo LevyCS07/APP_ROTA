@@ -6,7 +6,6 @@ import uuid
 import zipfile
 from pathlib import Path
 
-import numpy as np
 import openrouteservice
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -15,8 +14,6 @@ from fastapi.responses import StreamingResponse
 from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 
 TAXA_MINIMA = 0.60
 MAX_WAYPOINTS = 48
@@ -132,29 +129,6 @@ def build_collaborators(df, tipo_rota, destino):
     return collaborators
 
 
-def auto_assign(collaborators, capacidades):
-    if not collaborators or not capacidades:
-        return
-    n_routes = min(len(capacidades), len(collaborators))
-    coords = np.array([[c["lat"], c["lon"]] for c in collaborators])
-    if n_routes > 1:
-        labels = KMeans(n_clusters=n_routes, random_state=42, n_init=10).fit_predict(
-            StandardScaler().fit_transform(coords)
-        )
-    else:
-        labels = np.zeros(len(collaborators), dtype=int)
-    used = {i + 1: 0 for i in range(len(capacidades))}
-    for cluster in range(n_routes):
-        items = [c for c, label in zip(collaborators, labels) if label == cluster]
-        items.sort(key=lambda c: c["distKm"], reverse=True)
-        route_id = cluster + 1
-        cap = capacidades[cluster]
-        for item in items:
-            if used[route_id] < cap:
-                item["routeId"] = route_id
-                used[route_id] += 1
-
-
 def project_response(project):
     return {
         "id": project["id"],
@@ -176,7 +150,6 @@ async def create_project(
     destino_lat: float = Form(...),
     destino_lon: float = Form(...),
     tipo_rota: str = Form("Entrada"),
-    modo: str = Form("Manual"),
     capacidades: str = Form("[22]"),
 ):
     caps = [int(c) for c in json.loads(capacidades)]
@@ -189,8 +162,6 @@ async def create_project(
         {"id": i + 1, "name": f"ROTA_{i + 1:02d}", "capacity": cap}
         for i, cap in enumerate(caps)
     ]
-    if modo == "Automática":
-        auto_assign(collaborators, caps)
     project_id = str(uuid.uuid4())
     PROJECTS[project_id] = {
         "id": project_id,
