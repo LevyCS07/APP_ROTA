@@ -267,7 +267,6 @@ function MapEditor({ project, setProject }) {
 function App() {
   const [file, setFile] = useState(null);
   const [tipoRota, setTipoRota] = useState('Entrada');
-  const [modo, setModo] = useState('Manual');
   const [destino, setDestino] = useState({ lat: -3.119, lon: -60.021 });
   const [routeCount, setRouteCount] = useState(5);
   const [capacity, setCapacity] = useState(22);
@@ -278,18 +277,24 @@ function App() {
     if (!file) return alert('Selecione a planilha.');
     setLoading(true);
     try {
+      const health = await fetch(`${API_URL}/api/health`);
+      if (!health.ok) throw new Error(`Backend respondeu ${health.status} em ${API_URL}/api/health`);
+
       const form = new FormData();
       form.append('file', file);
       form.append('destino_lat', destino.lat);
       form.append('destino_lon', destino.lon);
       form.append('tipo_rota', tipoRota);
-      form.append('modo', modo);
       form.append('capacidades', JSON.stringify(Array.from({ length: routeCount }, () => Number(capacity))));
       const res = await fetch(`${API_URL}/api/projects`, { method: 'POST', body: form });
       if (!res.ok) throw new Error(await res.text());
       setProject(await res.json());
     } catch (err) {
-      alert(`Erro ao criar projeto: ${err.message}`);
+      alert(
+        `Erro ao criar projeto: ${err.message}\n\n` +
+        `API configurada no frontend: ${API_URL}\n\n` +
+        'Se a API estiver como localhost ou se o teste /api/health falhar no navegador, ajuste VITE_API_URL na Vercel e faça redeploy.'
+      );
     } finally {
       setLoading(false);
     }
@@ -300,12 +305,12 @@ function App() {
   return (
     <main className="setup">
       <section className="setup-card">
-        <h1>Roteamento de colaboradores</h1>
+        <h1>Roteamento semi-automático</h1>
+        <div className="api-box">API: {API_URL}</div>
         <label>Planilha Excel</label>
         <input type="file" accept=".xlsx" onChange={(e) => setFile(e.target.files?.[0])} />
         <div className="grid">
-          <label>Tipo de rota<select value={tipoRota} onChange={(e) => setTipoRota(e.target.value)}><option>Entrada</option><option>Saída</option></select></label>
-          <label>Modo<select value={modo} onChange={(e) => setModo(e.target.value)}><option>Manual</option><option>Automática</option></select></label>
+          <label>Tipo de coordenada para edição<select value={tipoRota} onChange={(e) => setTipoRota(e.target.value)}><option>Entrada</option><option>Saída</option></select></label>
           <label>Quantidade de rotas<input type="number" min="1" value={routeCount} onChange={(e) => setRouteCount(e.target.value)} /></label>
           <label>Capacidade<input type="number" min="1" value={capacity} onChange={(e) => setCapacity(e.target.value)} /></label>
           <label>Destino lat<input type="number" step="0.000001" value={destino.lat} onChange={(e) => setDestino({ ...destino, lat: Number(e.target.value) })} /></label>
