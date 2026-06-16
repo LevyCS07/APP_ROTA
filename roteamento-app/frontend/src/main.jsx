@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -59,20 +59,15 @@ function pointIcon(routeId, selected = false) {
 function MapEditor({ project, setProject }) {
   const mapRef = useRef(null);
   const layerRef = useRef(null);
+  const destinoMarkerRef = useRef(null);
   const markersRef = useRef({});
   const rectangleRef = useRef(null);
   const selectStartRef = useRef(null);
   const selectingRef = useRef(false);
+  const fittedProjectRef = useRef(null);
   const [selected, setSelected] = useState(new Set());
   const [bulkRoute, setBulkRoute] = useState(project.routes[0]?.id || 1);
-
-  const assignments = useMemo(() => {
-    const out = {};
-    project.collaborators.forEach((c) => {
-      if (c.routeId) out[c.id] = c.routeId;
-    });
-    return out;
-  }, [project]);
+  const [hiddenRoutes, setHiddenRoutes] = useState(new Set());
 
   useEffect(() => {
     if (mapRef.current) return;
@@ -97,10 +92,13 @@ function MapEditor({ project, setProject }) {
     markersRef.current = {};
 
     project.collaborators.forEach((collab) => {
+      if (collab.routeId && hiddenRoutes.has(collab.routeId)) return;
       const isSelected = selected.has(collab.id);
+      const route = project.routes.find((item) => item.id === collab.routeId);
+      const tooltip = collab.routeId ? `${collab.nome} (${route?.name || `Rota ${collab.routeId}`})` : `${collab.nome} (sem rota)`;
       const marker = L.marker([collab.lat, collab.lon], {
         icon: pointIcon(collab.routeId, isSelected)
-      }).bindTooltip(`${collab.nome}${collab.routeId ? '' : ' (sem rota)'}`);
+      }).bindTooltip(tooltip);
       marker.on('click', () => {
         setSelected((prev) => {
           const next = new Set(prev);
@@ -113,18 +111,25 @@ function MapEditor({ project, setProject }) {
       layer.addLayer(marker);
     });
 
-    L.marker([project.destino.lat, project.destino.lon], {
-      icon: L.divIcon({
-        className: '',
-        iconAnchor: [42, 12],
-        html: '<div class="destino-marker">Destino</div>'
-      })
-    }).addTo(map);
+    if (!destinoMarkerRef.current) {
+      destinoMarkerRef.current = L.marker([project.destino.lat, project.destino.lon], {
+        icon: L.divIcon({
+          className: '',
+          iconAnchor: [42, 12],
+          html: '<div class="destino-marker">Destino</div>'
+        })
+      }).addTo(map);
+    } else {
+      destinoMarkerRef.current.setLatLng([project.destino.lat, project.destino.lon]);
+    }
 
-    const bounds = L.latLngBounds(project.collaborators.map((c) => [c.lat, c.lon]));
-    bounds.extend([project.destino.lat, project.destino.lon]);
-    map.fitBounds(bounds.pad(0.15));
-  }, [project, selected]);
+    if (fittedProjectRef.current !== project.id && project.collaborators.length) {
+      const bounds = L.latLngBounds(project.collaborators.map((c) => [c.lat, c.lon]));
+      bounds.extend([project.destino.lat, project.destino.lon]);
+      map.fitBounds(bounds.pad(0.15));
+      fittedProjectRef.current = project.id;
+    }
+  }, [project, selected, hiddenRoutes]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -149,6 +154,7 @@ function MapEditor({ project, setProject }) {
       if (!selectingRef.current || !selectStartRef.current) return;
       const bounds = L.latLngBounds(selectStartRef.current, e.latlng);
       const ids = project.collaborators
+        .filter((c) => !c.routeId || !hiddenRoutes.has(c.routeId))
         .filter((c) => bounds.contains(L.latLng(c.lat, c.lon)))
         .map((c) => c.id);
       setSelected((prev) => new Set([...prev, ...ids]));
@@ -169,7 +175,7 @@ function MapEditor({ project, setProject }) {
       map.off('mousemove', onMouseMove);
       map.off('mouseup', onMouseUp);
     };
-  }, [project]);
+  }, [project, hiddenRoutes]);
 
   async function saveAssignments(nextProject = project) {
     const payload = {};
@@ -195,6 +201,22 @@ function MapEditor({ project, setProject }) {
     setProject(next);
   }
 
+  function toggleHiddenRoute(routeId) {
+    setHiddenRoutes((prev) => {
+      const next = new Set(prev);
+      if (next.has(routeId)) next.delete(routeId);
+      else next.add(routeId);
+      setSelected((current) => {
+        const cleaned = new Set(current);
+        project.collaborators.forEach((collab) => {
+          if (collab.routeId === routeId) cleaned.delete(collab.id);
+        });
+        return cleaned;
+      });
+      return next;
+    });
+  }
+
   async function addRoute() {
     const capacity = Number(prompt('Capacidade da nova rota', '22') || 22);
     const res = await fetch(`${API_URL}/api/projects/${project.id}/routes`, {
@@ -208,6 +230,21 @@ function MapEditor({ project, setProject }) {
   async function removeRoute(routeId) {
     const res = await fetch(`${API_URL}/api/projects/${project.id}/routes/${routeId}`, { method: 'DELETE' });
     if (res.ok) setProject(await res.json());
+  }
+
+  async function updateRouteCapacity(routeId, capacity) {
+    const nextCapacity = Math.max(1, Number(capacity || 1));
+    setProject({
+      ...project,
+      routes: project.routes.map((route) =>
+        route.id === routeId ? { ...route, capacity: nextCapacity } : route
+      )
+    });
+    await fetch(`${API_URL}/api/projects/${project.id}/routes/${routeId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ capacity: nextCapacity })
+    });
   }
 
   async function downloadZip() {
@@ -233,6 +270,10 @@ function MapEditor({ project, setProject }) {
     <div className="editor">
       <div id="map" />
       <aside className="panel">
+        <div className="panel-header">
+          <h2>Editor de rotas</h2>
+          <p>Selecione pontos no mapa e envie para uma rota.</p>
+        </div>
         <div className="panel-section">
           <button onClick={() => { selectingRef.current = true; }}>Selecionar área</button>
           <select value={bulkRoute} onChange={(e) => setBulkRoute(e.target.value)}>
@@ -252,10 +293,25 @@ function MapEditor({ project, setProject }) {
         <div className="routes-list">
           <div className="route-row sem-rota"><span>Sem rota</span><strong>{semRota}</strong></div>
           {counts.map((route) => (
-            <div className="route-row" key={route.id} style={{ borderLeftColor: routeColor(route.id) }}>
-              <span>{route.name}</span>
-              <strong>{route.count}/{route.capacity}</strong>
-              <button className="mini" onClick={() => removeRoute(route.id)} disabled={project.routes.length <= 1}>Remover</button>
+            <div className={`route-row ${hiddenRoutes.has(route.id) ? 'hidden-route' : ''}`} key={route.id} style={{ borderLeftColor: routeColor(route.id) }}>
+              <div className="route-main">
+                <span>{route.name}</span>
+                <strong>{route.count}/{route.capacity}</strong>
+              </div>
+              <label className="capacity-field">Cap.
+                <input
+                  type="number"
+                  min="1"
+                  value={route.capacity}
+                  onChange={(e) => updateRouteCapacity(route.id, e.target.value)}
+                />
+              </label>
+              <div className="route-actions">
+                <button className="mini" onClick={() => toggleHiddenRoute(route.id)}>
+                  {hiddenRoutes.has(route.id) ? 'Mostrar' : 'Ocultar'}
+                </button>
+                <button className="mini danger" onClick={() => removeRoute(route.id)} disabled={project.routes.length <= 1}>Remover</button>
+              </div>
             </div>
           ))}
         </div>
@@ -306,16 +362,15 @@ function App() {
     <main className="setup">
       <section className="setup-card">
         <h1>Roteamento semi-automático</h1>
-        <div className="api-box">API: {API_URL}</div>
+        <p className="setup-subtitle">Monte rotas por seleção visual no mapa e gere KMLs por ruas com ORS.</p>
         <label>Planilha Excel</label>
         <input type="file" accept=".xlsx" onChange={(e) => setFile(e.target.files?.[0])} />
         <div className="grid">
           <label>Tipo de coordenada para edição<select value={tipoRota} onChange={(e) => setTipoRota(e.target.value)}><option>Entrada</option><option>Saída</option></select></label>
           <label>Quantidade de rotas<input type="number" min="1" value={routeCount} onChange={(e) => setRouteCount(e.target.value)} /></label>
           <label>Capacidade<input type="number" min="1" value={capacity} onChange={(e) => setCapacity(e.target.value)} /></label>
-          <label>Destino lat<input type="number" step="0.000001" value={destino.lat} onChange={(e) => setDestino({ ...destino, lat: Number(e.target.value) })} /></label>
-          <label>Destino lon<input type="number" step="0.000001" value={destino.lon} onChange={(e) => setDestino({ ...destino, lon: Number(e.target.value) })} /></label>
         </div>
+        <div className="map-label">Selecione o destino</div>
         <DestinationPicker destino={destino} setDestino={setDestino} />
         <button className="primary" disabled={loading} onClick={createProject}>{loading ? 'Carregando...' : 'Abrir editor'}</button>
       </section>
