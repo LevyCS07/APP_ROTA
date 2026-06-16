@@ -22,7 +22,7 @@ CAMPO_NOME_BAIRRO = "Name"
 app = FastAPI(title="Roteamento API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
