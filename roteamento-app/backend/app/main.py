@@ -22,7 +22,7 @@ CAMPO_NOME_BAIRRO = "Name"
 app = FastAPI(title="Roteamento API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -195,6 +195,11 @@ class RoutePayload(BaseModel):
     name: str | None = None
 
 
+class RouteUpdatePayload(BaseModel):
+    capacity: int | None = None
+    name: str | None = None
+
+
 @app.post("/api/projects/{project_id}/routes")
 def add_route(project_id: str, payload: RoutePayload):
     project = PROJECTS.get(project_id)
@@ -205,6 +210,21 @@ def add_route(project_id: str, payload: RoutePayload):
         {"id": next_id, "name": payload.name or f"ROTA_{next_id:02d}", "capacity": int(payload.capacity)}
     )
     return project_response(project)
+
+
+@app.patch("/api/projects/{project_id}/routes/{route_id}")
+def update_route(project_id: str, route_id: int, payload: RouteUpdatePayload):
+    project = PROJECTS.get(project_id)
+    if not project:
+        raise HTTPException(404, "Projeto não encontrado.")
+    for route in project["routes"]:
+        if route["id"] == route_id:
+            if payload.capacity is not None:
+                route["capacity"] = max(1, int(payload.capacity))
+            if payload.name:
+                route["name"] = payload.name
+            return project_response(project)
+    raise HTTPException(404, "Rota não encontrada.")
 
 
 @app.delete("/api/projects/{project_id}/routes/{route_id}")
