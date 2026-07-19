@@ -2,6 +2,9 @@ import io
 import json
 import math
 import os
+import re
+import sqlite3
+import threading
 import uuid
 import zipfile
 from pathlib import Path
@@ -15,41 +18,68 @@ from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
 
-TAXA_MINIMA = 0.60
-MAX_WAYPOINTS = 48
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_WAYPOINTS = 48  # Inclui o destino final.
 CAMPO_NOME_BAIRRO = "Name"
+TIPOS_ROTA = {"Entrada", "Saída"}
 
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("APP_DATA_DIR", BASE_DIR / "data"))
+DB_PATH = Path(os.getenv("PROJECTS_DB_PATH", DATA_DIR / "projects.sqlite3"))
+BAIRROS_CACHE = None
+DB_LOCK = threading.RLock()
+
+allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
 app = FastAPI(title="Roteamento API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-PROJECTS = {}
-BAIRROS_CACHE = None
+
+def init_db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+
+
+def load_project(project_id: str):
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT data FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Projeto não encontrado.")
+    return json.loads(row[0])
+
+
+def save_project(project):
+    payload = json.dumps(project, ensure_ascii=False, separators=(",", ":"))
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO projects(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+            (project["id"], payload),
+        )
 
 
 def haversine(lat1, lon1, lat2, lon2):
-    r = 6371
+    radius_km = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+    return 2 * radius_km * math.asin(math.sqrt(a))
+
+
+def valid_coordinate(lat, lon):
+    return math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
 
 
 def geojson_path():
-    candidates = [
-        os.getenv("BAIRROS_GEOJSON_PATH"),
-        Path(__file__).parent / "data" / "BAIRROS_MANAUS.geojson",
-        Path.cwd() / "BAIRROS_MANAUS.geojson",
-        Path(r"C:\Users\Levy Souza\Desktop\APOIO\BAIRROS_MANAUS.geojson"),
-    ]
+    candidates = [os.getenv("BAIRROS_GEOJSON_PATH"), DATA_DIR / "BAIRROS_MANAUS.geojson", Path.cwd() / "BAIRROS_MANAUS.geojson"]
     for candidate in candidates:
-        if candidate and Path(candidate).exists():
+        if candidate and Path(candidate).is_file():
             return Path(candidate)
     raise HTTPException(500, "BAIRROS_MANAUS.geojson não encontrado. Configure BAIRROS_GEOJSON_PATH.")
 
@@ -58,34 +88,36 @@ def carregar_bairros():
     global BAIRROS_CACHE
     if BAIRROS_CACHE is not None:
         return BAIRROS_CACHE
-    with geojson_path().open("r", encoding="utf-8-sig") as f:
-        geojson = json.load(f)
+    try:
+        with geojson_path().open("r", encoding="utf-8-sig") as file:
+            geojson = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, "Não foi possível carregar o GeoJSON de bairros.") from exc
     bairros = []
-    for feat in geojson.get("features", []):
-        props = feat.get("properties", {})
-        nome = str(props.get(CAMPO_NOME_BAIRRO) or props.get("NOME") or props.get("BAIRRO") or f"B{len(bairros)}")
-        geom = shape(feat["geometry"])
-        centroid = geom.centroid
-        bairros.append(
-            {
-                "idx": len(bairros),
-                "nome": nome,
-                "geometry": geom,
-                "centroid_lat": centroid.y,
-                "centroid_lon": centroid.x,
-            }
-        )
+    for feature in geojson.get("features", []):
+        if not feature.get("geometry"):
+            continue
+        geometry = shape(feature["geometry"])
+        if geometry.is_empty:
+            continue
+        properties = feature.get("properties", {})
+        nome = str(properties.get(CAMPO_NOME_BAIRRO) or properties.get("NOME") or properties.get("BAIRRO") or f"B{len(bairros)}")
+        centroid = geometry.centroid
+        bairros.append({"idx": len(bairros), "nome": nome, "geometry": geometry, "centroid_lat": centroid.y, "centroid_lon": centroid.x})
+    if not bairros:
+        raise HTTPException(500, "O GeoJSON não contém bairros utilizáveis.")
     BAIRROS_CACHE = bairros
     return bairros
 
 
 def atribuir_bairro(lat, lon, bairros):
-    pt = Point(lon, lat)
+    point = Point(lon, lat)
     for bairro in bairros:
-        if bairro["geometry"].contains(pt):
+        # covers também inclui pontos que caem exatamente na fronteira do polígono.
+        if bairro["geometry"].covers(point):
             return bairro["idx"], bairro["nome"]
-    melhor = min(bairros, key=lambda b: haversine(lat, lon, b["centroid_lat"], b["centroid_lon"]))
-    return melhor["idx"], melhor["nome"]
+    nearest = min(bairros, key=lambda bairro: haversine(lat, lon, bairro["centroid_lat"], bairro["centroid_lon"]))
+    return nearest["idx"], nearest["nome"]
 
 
 def colunas_tipo(tipo):
@@ -93,14 +125,21 @@ def colunas_tipo(tipo):
 
 
 def read_excel(file_bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="BD")
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="BD")
+    except Exception as exc:
+        raise HTTPException(400, "Arquivo Excel inválido ou aba 'BD' não encontrada.") from exc
     required = ["COLABORADOR", "LAT E", "LONG E", "LAT S", "LONG S"]
-    missing = [col for col in required if col not in df.columns]
+    missing = [column for column in required if column not in df.columns]
     if missing:
         raise HTTPException(400, f"Colunas ausentes: {', '.join(missing)}")
-    for col in ["LAT E", "LONG E", "LAT S", "LONG S"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["LAT E", "LONG E", "LAT S", "LONG S"]).reset_index(drop=True)
+    for column in required[1:]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=required[1:]).reset_index(drop=True)
+    invalid = ~df.apply(lambda row: valid_coordinate(float(row["LAT E"]), float(row["LONG E"])) and valid_coordinate(float(row["LAT S"]), float(row["LONG S"])), axis=1)
+    if invalid.any():
+        raise HTTPException(400, "A planilha contém coordenadas fora dos limites válidos.")
+    return df
 
 
 def build_collaborators(df, tipo_rota, destino):
@@ -110,33 +149,22 @@ def build_collaborators(df, tipo_rota, destino):
     for idx, row in df.iterrows():
         lat, lon = float(row[lat_col]), float(row[lon_col])
         bairro_idx, bairro_nome = atribuir_bairro(lat, lon, bairros)
-        collaborators.append(
-            {
-                "id": int(idx),
-                "nome": str(row["COLABORADOR"]),
-                "bairro_idx": int(bairro_idx),
-                "bairro": bairro_nome,
-                "latE": float(row["LAT E"]),
-                "lonE": float(row["LONG E"]),
-                "latS": float(row["LAT S"]),
-                "lonS": float(row["LONG S"]),
-                "lat": lat,
-                "lon": lon,
-                "distKm": round(haversine(lat, lon, destino["lat"], destino["lon"]), 3),
-                "routeId": None,
-            }
-        )
+        collaborators.append({"id": int(idx), "nome": str(row["COLABORADOR"]), "bairro_idx": bairro_idx, "bairro": bairro_nome, "latE": float(row["LAT E"]), "lonE": float(row["LONG E"]), "latS": float(row["LAT S"]), "lonS": float(row["LONG S"]), "lat": lat, "lon": lon, "distKm": round(haversine(lat, lon, destino["lat"], destino["lon"]), 3), "routeId": None})
     return collaborators
 
 
 def project_response(project):
-    return {
-        "id": project["id"],
-        "destino": project["destino"],
-        "tipoRota": project["tipoRota"],
-        "routes": project["routes"],
-        "collaborators": project["collaborators"],
-    }
+    return {key: project[key] for key in ("id", "destino", "tipoRota", "routes", "collaborators")}
+
+
+def safe_filename(value):
+    result = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return result.strip("._")[:80] or "rota"
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 @app.get("/api/health")
@@ -145,32 +173,28 @@ def health():
 
 
 @app.post("/api/projects")
-async def create_project(
-    file: UploadFile = File(...),
-    destino_lat: float = Form(...),
-    destino_lon: float = Form(...),
-    tipo_rota: str = Form("Entrada"),
-    capacidades: str = Form("[22]"),
-):
-    caps = [int(c) for c in json.loads(capacidades)]
-    if not caps:
-        raise HTTPException(400, "Informe ao menos uma rota.")
-    df = read_excel(await file.read())
+async def create_project(file: UploadFile = File(...), destino_lat: float = Form(...), destino_lon: float = Form(...), tipo_rota: str = Form("Entrada"), capacidades: str = Form("[22]")):
+    if tipo_rota not in TIPOS_ROTA:
+        raise HTTPException(422, "tipo_rota deve ser 'Entrada' ou 'Saída'.")
+    if not valid_coordinate(destino_lat, destino_lon):
+        raise HTTPException(422, "Coordenadas de destino inválidas.")
+    if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Envie um arquivo .xlsx ou .xls.")
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "O arquivo excede o limite de 15 MB.")
+    try:
+        caps = json.loads(capacidades)
+        if not isinstance(caps, list) or not caps or any(isinstance(cap, bool) or int(cap) < 1 for cap in caps):
+            raise ValueError
+        caps = [int(cap) for cap in caps]
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "capacidades deve ser uma lista JSON de inteiros positivos.") from exc
+    df = read_excel(contents)
     destino = {"lat": float(destino_lat), "lon": float(destino_lon)}
-    collaborators = build_collaborators(df, tipo_rota, destino)
-    routes = [
-        {"id": i + 1, "name": f"ROTA_{i + 1:02d}", "capacity": cap}
-        for i, cap in enumerate(caps)
-    ]
-    project_id = str(uuid.uuid4())
-    PROJECTS[project_id] = {
-        "id": project_id,
-        "destino": destino,
-        "tipoRota": tipo_rota,
-        "routes": routes,
-        "collaborators": collaborators,
-    }
-    return project_response(PROJECTS[project_id])
+    project = {"id": str(uuid.uuid4()), "destino": destino, "tipoRota": tipo_rota, "routes": [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacity} for index, capacity in enumerate(caps)], "collaborators": build_collaborators(df, tipo_rota, destino)}
+    save_project(project)
+    return project_response(project)
 
 
 class AssignmentPayload(BaseModel):
@@ -179,14 +203,21 @@ class AssignmentPayload(BaseModel):
 
 @app.put("/api/projects/{project_id}/assignments")
 def update_assignments(project_id: str, payload: AssignmentPayload):
-    project = PROJECTS.get(project_id)
-    if not project:
-        raise HTTPException(404, "Projeto não encontrado.")
-    valid_routes = {route["id"] for route in project["routes"]}
-    for collaborator in project["collaborators"]:
-        if collaborator["id"] in payload.assignments:
-            route_id = payload.assignments[collaborator["id"]]
-            collaborator["routeId"] = route_id if route_id in valid_routes else None
+    project = load_project(project_id)
+    routes = {route["id"]: route for route in project["routes"]}
+    collaborators = {collaborator["id"]: collaborator for collaborator in project["collaborators"]}
+    unknown_people = set(payload.assignments) - set(collaborators)
+    unknown_routes = {route_id for route_id in payload.assignments.values() if route_id is not None and route_id not in routes}
+    if unknown_people or unknown_routes:
+        raise HTTPException(422, "A atribuição contém colaborador ou rota inexistente.")
+    desired = {person_id: person["routeId"] for person_id, person in collaborators.items()}
+    desired.update(payload.assignments)
+    for route_id, route in routes.items():
+        if sum(value == route_id for value in desired.values()) > route["capacity"]:
+            raise HTTPException(422, f"A capacidade da rota '{route['name']}' seria excedida.")
+    for person_id, route_id in payload.assignments.items():
+        collaborators[person_id]["routeId"] = route_id
+    save_project(project)
     return project_response(project)
 
 
@@ -202,42 +233,51 @@ class RouteUpdatePayload(BaseModel):
 
 @app.post("/api/projects/{project_id}/routes")
 def add_route(project_id: str, payload: RoutePayload):
-    project = PROJECTS.get(project_id)
-    if not project:
-        raise HTTPException(404, "Projeto não encontrado.")
+    if payload.capacity < 1:
+        raise HTTPException(422, "A capacidade deve ser maior que zero.")
+    project = load_project(project_id)
     next_id = max([route["id"] for route in project["routes"]] or [0]) + 1
-    project["routes"].append(
-        {"id": next_id, "name": payload.name or f"ROTA_{next_id:02d}", "capacity": int(payload.capacity)}
-    )
+    name = (payload.name or f"ROTA_{next_id:02d}").strip()
+    if not name:
+        raise HTTPException(422, "O nome da rota não pode ficar vazio.")
+    project["routes"].append({"id": next_id, "name": name[:100], "capacity": payload.capacity})
+    save_project(project)
     return project_response(project)
 
 
 @app.patch("/api/projects/{project_id}/routes/{route_id}")
 def update_route(project_id: str, route_id: int, payload: RouteUpdatePayload):
-    project = PROJECTS.get(project_id)
-    if not project:
-        raise HTTPException(404, "Projeto não encontrado.")
-    for route in project["routes"]:
-        if route["id"] == route_id:
-            if payload.capacity is not None:
-                route["capacity"] = max(1, int(payload.capacity))
-            if payload.name:
-                route["name"] = payload.name
-            return project_response(project)
-    raise HTTPException(404, "Rota não encontrada.")
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
+    assigned = sum(person["routeId"] == route_id for person in project["collaborators"])
+    if payload.capacity is not None:
+        if payload.capacity < 1 or payload.capacity < assigned:
+            raise HTTPException(422, f"A capacidade deve ser no mínimo {max(1, assigned)}.")
+        route["capacity"] = payload.capacity
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(422, "O nome da rota não pode ficar vazio.")
+        route["name"] = name[:100]
+    save_project(project)
+    return project_response(project)
 
 
 @app.delete("/api/projects/{project_id}/routes/{route_id}")
 def remove_route(project_id: str, route_id: int):
-    project = PROJECTS.get(project_id)
-    if not project:
-        raise HTTPException(404, "Projeto não encontrado.")
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
     if len(project["routes"]) <= 1:
         raise HTTPException(400, "Mantenha ao menos uma rota.")
-    project["routes"] = [route for route in project["routes"] if route["id"] != route_id]
+    project["routes"] = [item for item in project["routes"] if item["id"] != route_id]
     for collaborator in project["collaborators"]:
         if collaborator["routeId"] == route_id:
             collaborator["routeId"] = None
+    save_project(project)
     return project_response(project)
 
 
@@ -246,68 +286,52 @@ def ors_route(coords):
     if not key or len(coords) > MAX_WAYPOINTS:
         return coords
     try:
-        client = openrouteservice.Client(key=key)
-        res = client.directions(coordinates=coords, profile="driving-car", optimize_waypoints=True, format="geojson")
-        return res["features"][0]["geometry"]["coordinates"]
+        client = openrouteservice.Client(key=key, timeout=15)
+        response = client.directions(coordinates=coords, profile="driving-car", optimize_waypoints=True, format="geojson")
+        return response["features"][0]["geometry"]["coordinates"]
     except Exception:
+        # A exportação continua possível, mas o trajeto será uma linha direta.
         return coords
 
 
 def gerar_kml(nome_rota, tipo, rows, destino):
-    col_lat, col_lon = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
-    coords = [[row[col_lon], row[col_lat]] for row in rows] + [[destino["lon"], destino["lat"]]]
+    lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
+    coords = [[row[lon_key], row[lat_key]] for row in rows] + [[destino["lon"], destino["lat"]]]
     route_coords = ors_route(coords)
-
-    kml_root = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
-    doc = etree.SubElement(kml_root, "Document")
-    etree.SubElement(doc, "name").text = f"{nome_rota} ({tipo})"
+    kml = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+    document = etree.SubElement(kml, "Document")
+    etree.SubElement(document, "name").text = f"{nome_rota} ({tipo})"
     for row in rows:
-        pm = etree.SubElement(doc, "Placemark")
-        etree.SubElement(pm, "name").text = row["nome"]
-        pt = etree.SubElement(pm, "Point")
-        etree.SubElement(pt, "coordinates").text = f"{row[col_lon]},{row[col_lat]},0"
-    line = etree.SubElement(doc, "Placemark")
+        placemark = etree.SubElement(document, "Placemark")
+        etree.SubElement(placemark, "name").text = row["nome"]
+        point = etree.SubElement(placemark, "Point")
+        etree.SubElement(point, "coordinates").text = f"{row[lon_key]},{row[lat_key]},0"
+    line = etree.SubElement(document, "Placemark")
     etree.SubElement(line, "name").text = f"Trajeto {nome_rota} ({tipo})"
-    ls = etree.SubElement(line, "LineString")
-    etree.SubElement(ls, "tessellate").text = "1"
-    etree.SubElement(ls, "coordinates").text = " ".join([f"{lon},{lat},0" for lon, lat in route_coords])
-    buf = io.BytesIO()
-    etree.ElementTree(kml_root).write(buf, pretty_print=True, xml_declaration=True, encoding="UTF-8")
-    return buf.getvalue()
+    line_string = etree.SubElement(line, "LineString")
+    etree.SubElement(line_string, "tessellate").text = "1"
+    etree.SubElement(line_string, "coordinates").text = " ".join(f"{lon},{lat},0" for lon, lat in route_coords)
+    output = io.BytesIO()
+    etree.ElementTree(kml).write(output, pretty_print=True, xml_declaration=True, encoding="UTF-8")
+    return output.getvalue()
 
 
 @app.get("/api/projects/{project_id}/download")
 def download(project_id: str):
-    project = PROJECTS.get(project_id)
-    if not project:
-        raise HTTPException(404, "Projeto não encontrado.")
-    zip_buffer = io.BytesIO()
+    project = load_project(project_id)
+    archive = io.BytesIO()
     report_rows = []
-    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
         for route in project["routes"]:
-            rows = [c for c in project["collaborators"] if c["routeId"] == route["id"]]
+            rows = [person for person in project["collaborators"] if person["routeId"] == route["id"]]
             if not rows:
                 continue
-            for tipo in ["Entrada", "Saída"]:
-                zf.writestr(f'{route["name"]}_{tipo.lower()}.kml', gerar_kml(route["name"], tipo, rows, project["destino"]))
-            for row in rows:
-                report_rows.append(
-                    {
-                        "ROTA": route["name"],
-                        "COLABORADOR": row["nome"],
-                        "BAIRRO": row["bairro"],
-                        "LAT E": row["latE"],
-                        "LONG E": row["lonE"],
-                        "LAT S": row["latS"],
-                        "LONG S": row["lonS"],
-                    }
-                )
-        xlsx = io.BytesIO()
-        pd.DataFrame(report_rows).to_excel(xlsx, index=False)
-        zf.writestr("relatorio_rotas.xlsx", xlsx.getvalue())
-    zip_buffer.seek(0)
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="rotas_kml_relatorio.zip"'},
-    )
+            route_filename = safe_filename(route["name"])
+            for tipo in TIPOS_ROTA:
+                zipped.writestr(f"{route_filename}_{safe_filename(tipo).lower()}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
+            report_rows.extend({"ROTA": route["name"], "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for row in rows)
+        spreadsheet = io.BytesIO()
+        pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
+        zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
+    archive.seek(0)
+    return StreamingResponse(archive, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="rotas_kml_relatorio.zip"'})
