@@ -29,7 +29,7 @@ DB_PATH = Path(os.getenv("PROJECTS_DB_PATH", DATA_DIR / "projects.sqlite3"))
 BAIRROS_CACHE = None
 DB_LOCK = threading.RLock()
 
-allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
+allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "https://app-rota.vercel.app/").split(",") if origin.strip()]
 app = FastAPI(title="Roteamento API")
 app.add_middleware(
     CORSMiddleware,
