@@ -149,8 +149,31 @@ def build_collaborators(df, tipo_rota, destino):
     for idx, row in df.iterrows():
         lat, lon = float(row[lat_col]), float(row[lon_col])
         bairro_idx, bairro_nome = atribuir_bairro(lat, lon, bairros)
-        collaborators.append({"id": int(idx), "nome": str(row["COLABORADOR"]), "bairro_idx": bairro_idx, "bairro": bairro_nome, "latE": float(row["LAT E"]), "lonE": float(row["LONG E"]), "latS": float(row["LAT S"]), "lonS": float(row["LONG S"]), "lat": lat, "lon": lon, "distKm": round(haversine(lat, lon, destino["lat"], destino["lon"]), 3), "routeId": None})
+        collaborators.append({
+            "id": int(idx),
+            "nome": str(row["COLABORADOR"]),
+            "bairro_idx": bairro_idx,
+            "bairro": bairro_nome,
+            "latE": float(row["LAT E"]),
+            "lonE": float(row["LONG E"]),
+            "latS": float(row["LAT S"]),
+            "lonS": float(row["LONG S"]),
+            "lat": lat,
+            "lon": lon,
+            "distKm": round(haversine(lat, lon, destino["lat"], destino["lon"]), 3),
+            "routeId": None,
+            # Posição do colaborador na sequência de embarque dentro da rota (0-based).
+            # None enquanto o colaborador não pertence a nenhuma rota.
+            "order": None,
+        })
     return collaborators
+
+
+def ordered_route_rows(project, route_id):
+    """Colaboradores de uma rota, na ordem de embarque definida pelo usuário."""
+    rows = [c for c in project["collaborators"] if c["routeId"] == route_id]
+    rows.sort(key=lambda c: (c["order"] if c["order"] is not None else 10 ** 9, c["id"]))
+    return rows
 
 
 def project_response(project):
@@ -216,7 +239,21 @@ def update_assignments(project_id: str, payload: AssignmentPayload):
         if sum(value == route_id for value in desired.values()) > route["capacity"]:
             raise HTTPException(422, f"A capacidade da rota '{route['name']}' seria excedida.")
     for person_id, route_id in payload.assignments.items():
-        collaborators[person_id]["routeId"] = route_id
+        person = collaborators[person_id]
+        if route_id == person["routeId"]:
+            continue
+        person["routeId"] = route_id
+        if route_id is None:
+            # Colaborador saiu de uma rota: não faz mais parte de nenhuma sequência de embarque.
+            person["order"] = None
+        else:
+            # Colaborador novo (ou trocando de rota): entra no fim da sequência de embarque.
+            existing_orders = [
+                other["order"]
+                for other in project["collaborators"]
+                if other["routeId"] == route_id and other["order"] is not None and other["id"] != person_id
+            ]
+            person["order"] = (max(existing_orders) + 1) if existing_orders else 0
     save_project(project)
     return project_response(project)
 
@@ -229,6 +266,11 @@ class RoutePayload(BaseModel):
 class RouteUpdatePayload(BaseModel):
     capacity: int | None = None
     name: str | None = None
+
+
+class RouteOrderPayload(BaseModel):
+    # Lista com o id de todos os colaboradores da rota, na ordem de embarque desejada.
+    order: list[int]
 
 
 @app.post("/api/projects/{project_id}/routes")
@@ -277,27 +319,69 @@ def remove_route(project_id: str, route_id: int):
     for collaborator in project["collaborators"]:
         if collaborator["routeId"] == route_id:
             collaborator["routeId"] = None
+            collaborator["order"] = None
+    save_project(project)
+    return project_response(project)
+
+
+@app.put("/api/projects/{project_id}/routes/{route_id}/order")
+def reorder_route(project_id: str, route_id: int, payload: RouteOrderPayload):
+    """Define a ordem de embarque dos colaboradores de uma rota."""
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
+    assigned = {c["id"]: c for c in project["collaborators"] if c["routeId"] == route_id}
+    if set(payload.order) != set(assigned):
+        raise HTTPException(422, "A lista de ordenação deve conter exatamente os colaboradores da rota, sem repetição.")
+    for index, person_id in enumerate(payload.order):
+        assigned[person_id]["order"] = index
     save_project(project)
     return project_response(project)
 
 
 def ors_route(coords):
+    """Retorna (coordenadas, usou_ors). Se a chave não estiver configurada, exceder o
+    limite de waypoints, ou a chamada falhar, cai para uma linha reta entre os pontos."""
     key = os.getenv("ORS_API_KEY")
     if not key or len(coords) > MAX_WAYPOINTS:
-        return coords
+        return coords, False
     try:
         client = openrouteservice.Client(key=key, timeout=15)
         response = client.directions(coordinates=coords, profile="driving-car", optimize_waypoints=True, format="geojson")
-        return response["features"][0]["geometry"]["coordinates"]
+        return response["features"][0]["geometry"]["coordinates"], True
     except Exception:
         # A exportação continua possível, mas o trajeto será uma linha direta.
-        return coords
+        return coords, False
+
+
+@app.get("/api/projects/{project_id}/routes/{route_id}/preview")
+def preview_route(project_id: str, route_id: int, tipo: str = "Entrada"):
+    """Retorna o trajeto (linha real via ORS) e a sequência de embarque de uma rota,
+    para exibição no mapa antes de baixar os KMLs."""
+    if tipo not in TIPOS_ROTA:
+        raise HTTPException(422, "tipo deve ser 'Entrada' ou 'Saída'.")
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
+    rows = ordered_route_rows(project, route_id)
+    if not rows:
+        return {"waypoints": [], "coordinates": [], "usedOrs": False}
+    lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
+    coords = [[row[lon_key], row[lat_key]] for row in rows] + [[project["destino"]["lon"], project["destino"]["lat"]]]
+    route_coords, used_ors = ors_route(coords)
+    waypoints = [
+        {"id": row["id"], "nome": row["nome"], "lat": row[lat_key], "lon": row[lon_key], "order": index + 1}
+        for index, row in enumerate(rows)
+    ]
+    return {"waypoints": waypoints, "coordinates": route_coords, "usedOrs": used_ors}
 
 
 def gerar_kml(nome_rota, tipo, rows, destino):
     lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
     coords = [[row[lon_key], row[lat_key]] for row in rows] + [[destino["lon"], destino["lat"]]]
-    route_coords = ors_route(coords)
+    route_coords, _used_ors = ors_route(coords)
     kml = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     document = etree.SubElement(kml, "Document")
     etree.SubElement(document, "name").text = f"{nome_rota} ({tipo})"
@@ -323,13 +407,14 @@ def download(project_id: str):
     report_rows = []
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
         for route in project["routes"]:
-            rows = [person for person in project["collaborators"] if person["routeId"] == route["id"]]
+            # Respeita a ordem de embarque definida pelo usuário no editor.
+            rows = ordered_route_rows(project, route["id"])
             if not rows:
                 continue
             route_filename = safe_filename(route["name"])
             for tipo in TIPOS_ROTA:
                 zipped.writestr(f"{route_filename}_{safe_filename(tipo).lower()}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
-            report_rows.extend({"ROTA": route["name"], "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for row in rows)
+            report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for index, row in enumerate(rows))
         spreadsheet = io.BytesIO()
         pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
         zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
