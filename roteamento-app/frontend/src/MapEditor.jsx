@@ -49,6 +49,14 @@ export default function MapEditor({ project, setProject }) {
   const [hiddenRoutes, setHiddenRoutes] = useState(new Set());
   const [focusedRouteId, setFocusedRouteId] = useState(null);
   const [preview, setPreview] = useState(EMPTY_PREVIEW);
+  // Espelha selectingRef em estado só para dar feedback visual no botão
+  // "Selecionar área" (o ref sozinho é o que os handlers do mapa usam de fato).
+  const [selecting, setSelecting] = useState(false);
+
+  function setSelectMode(value) {
+    selectingRef.current = value;
+    setSelecting(value);
+  }
 
   // Mapa de colaboradorId -> posição na sequência de embarque, para a rota em foco.
   const orderByCollabId = new Map(
@@ -162,6 +170,7 @@ export default function MapEditor({ project, setProject }) {
       }
       selectStartRef.current = null;
       selectingRef.current = false;
+      setSelecting(false);
       map.dragging.enable();
     };
 
@@ -377,7 +386,8 @@ export default function MapEditor({ project, setProject }) {
         selectedCount={selected.size}
         bulkRoute={bulkRoute}
         setBulkRoute={setBulkRoute}
-        onStartAreaSelect={() => { selectingRef.current = true; }}
+        onStartAreaSelect={() => setSelectMode(!selecting)}
+        selecting={selecting}
         onApplySelected={applySelected}
         onClearSelection={() => setSelected(new Set())}
         onAddRoute={addRoute}
