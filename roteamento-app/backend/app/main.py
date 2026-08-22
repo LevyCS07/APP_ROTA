@@ -340,6 +340,43 @@ def reorder_route(project_id: str, route_id: int, payload: RouteOrderPayload):
     return project_response(project)
 
 
+@app.post("/api/projects/{project_id}/routes/{route_id}/auto-order")
+def auto_order_route(project_id: str, route_id: int, tipo: str = "Entrada"):
+    """Ordena automaticamente a sequência de embarque de uma rota:
+    começa pelo colaborador mais distante do destino e, a cada passo,
+    avança para o colaborador não visitado mais próximo do atual
+    (heurística do vizinho mais próximo), até esgotar a rota — a ideia é
+    ir 'fechando' a distância até o destino, que é sempre a última parada."""
+    if tipo not in TIPOS_ROTA:
+        raise HTTPException(422, "tipo deve ser 'Entrada' ou 'Saída'.")
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
+    rows = [c for c in project["collaborators"] if c["routeId"] == route_id]
+    if not rows:
+        return project_response(project)
+
+    lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
+    destino = project["destino"]
+
+    remaining = rows.copy()
+    # Ponto de partida: o colaborador mais distante do destino.
+    current = max(remaining, key=lambda row: haversine(row[lat_key], row[lon_key], destino["lat"], destino["lon"]))
+    ordered = [current]
+    remaining.remove(current)
+    while remaining:
+        nxt = min(remaining, key=lambda row: haversine(current[lat_key], current[lon_key], row[lat_key], row[lon_key]))
+        ordered.append(nxt)
+        remaining.remove(nxt)
+        current = nxt
+
+    for index, row in enumerate(ordered):
+        row["order"] = index
+    save_project(project)
+    return project_response(project)
+
+
 def ors_route(coords):
     """Retorna (coordenadas, usou_ors). Se a chave não estiver configurada, exceder o
     limite de waypoints, ou a chamada falhar, cai para uma linha reta entre os pontos."""
