@@ -24,6 +24,7 @@ export default function RoutesPanel({
   onToggleFocusRoute,
   routeCollaborators,
   onReorderRoute,
+  onAutoOrderRoute,
   preview
 }) {
   const counts = project.routes.map((route) => ({
@@ -113,6 +114,17 @@ export default function RoutesPanel({
                         : 'Linha reta entre os pontos (defina ORS_API_KEY no backend para trajeto real).'}
                     </span>
                   )}
+                  <button
+                    type="button"
+                    className="auto-order-btn"
+                    disabled={preview.loading || routeCollaborators.length < 2}
+                    onClick={() => onAutoOrderRoute(route.id)}
+                  >
+                    Ordenar automaticamente (mais distante → destino)
+                  </button>
+                  <p className="muted small">
+                    Arraste um colaborador para reposicionar, ou use as setas para ajustes finos.
+                  </p>
                   <RouteOrderList
                     collaborators={routeCollaborators}
                     onReorder={onReorderRoute}

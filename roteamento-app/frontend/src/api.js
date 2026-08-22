@@ -56,6 +56,14 @@ export const api = {
     });
   },
 
+  // Ordena automaticamente: começa no colaborador mais distante do destino e
+  // encadeia pelo vizinho mais próximo até o fim da rota.
+  autoOrderRoute(projectId, routeId, tipo) {
+    return requestJson(`/api/projects/${projectId}/routes/${routeId}/auto-order?tipo=${encodeURIComponent(tipo)}`, {
+      method: 'POST'
+    });
+  },
+
   // Busca o trajeto real (linha via ORS) e a sequência de embarque de uma rota.
   previewRoute(projectId, routeId, tipo) {
     return requestJson(`/api/projects/${projectId}/routes/${routeId}/preview?tipo=${encodeURIComponent(tipo)}`);

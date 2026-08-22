@@ -175,14 +175,52 @@ export default function MapEditor({ project, setProject }) {
     };
   }, [project, hiddenRoutes]);
 
-  // Busca e desenha o trajeto real da rota em foco.
-  useEffect(() => {
+  // Envia ao backend o estado atual de atribuição de rotas (routeId de cada
+  // colaborador). Ações como "Adicionar selecionados" só mudam o estado local
+  // no navegador — sem isso, o servidor fica com uma versão desatualizada do
+  // projeto, e endpoints que dependem dela (preview de trajeto, reordenar
+  // embarque) passam a rejeitar os dados por não baterem com o que já foi
+  // salvo. Por isso ela é chamada automaticamente antes dessas ações, além de
+  // poder ser disparada manualmente pelo botão "Salvar edições".
+  async function syncAssignments(nextProject = project) {
+    const payload = {};
+    nextProject.collaborators.forEach((c) => {
+      payload[c.id] = c.routeId || null;
+    });
+    return api.saveAssignments(project.id, payload);
+  }
+
+  async function saveAssignments(nextProject = project) {
+    setProject(await syncAssignments(nextProject));
+  }
+
+  function drawTrajeto(coordinates) {
     const map = mapRef.current;
     if (trajetoLayerRef.current) {
       map.removeLayer(trajetoLayerRef.current);
       trajetoLayerRef.current = null;
     }
+    if (coordinates?.length > 1) {
+      const latlngs = coordinates.map(([lon, lat]) => [lat, lon]);
+      trajetoLayerRef.current = L.polyline(latlngs, {
+        color: routeColor(focusedRouteId),
+        weight: 4,
+        opacity: 0.85
+      }).addTo(map);
+      return latlngs;
+    }
+    return null;
+  }
+
+  // Busca e desenha o trajeto real da rota em foco. Sincroniza as
+  // atribuições com o backend primeiro, para garantir que o preview reflita
+  // qualquer edição local ainda não salva.
+  useEffect(() => {
     if (!focusedRouteId) {
+      if (trajetoLayerRef.current) {
+        mapRef.current.removeLayer(trajetoLayerRef.current);
+        trajetoLayerRef.current = null;
+      }
       setPreview(EMPTY_PREVIEW);
       return;
     }
@@ -190,8 +228,12 @@ export default function MapEditor({ project, setProject }) {
     let cancelled = false;
     setPreview({ ...EMPTY_PREVIEW, loading: true });
 
-    api.previewRoute(project.id, focusedRouteId, project.tipoRota)
-      .then((data) => {
+    (async () => {
+      try {
+        const synced = await syncAssignments();
+        if (cancelled) return;
+        setProject(synced);
+        const data = await api.previewRoute(synced.id, focusedRouteId, synced.tipoRota);
         if (cancelled) return;
         setPreview({
           loading: false,
@@ -200,35 +242,19 @@ export default function MapEditor({ project, setProject }) {
           waypoints: data.waypoints,
           usedRealRoute: Boolean(data.usedOrs)
         });
-        if (data.coordinates?.length > 1) {
-          const latlngs = data.coordinates.map(([lon, lat]) => [lat, lon]);
-          trajetoLayerRef.current = L.polyline(latlngs, {
-            color: routeColor(focusedRouteId),
-            weight: 4,
-            opacity: 0.85
-          }).addTo(map);
-          map.fitBounds(L.latLngBounds(latlngs).pad(0.2));
-        }
-      })
-      .catch((err) => {
+        const latlngs = drawTrajeto(data.coordinates);
+        if (latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+      } catch (err) {
         if (cancelled) return;
         setPreview({ ...EMPTY_PREVIEW, error: err.message || 'Não foi possível calcular o trajeto.' });
-      });
+      }
+    })();
 
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedRouteId, project.id, project.tipoRota]);
-
-  async function saveAssignments(nextProject = project) {
-    const payload = {};
-    nextProject.collaborators.forEach((c) => {
-      payload[c.id] = c.routeId || null;
-    });
-    const updated = await api.saveAssignments(project.id, payload);
-    setProject(updated);
-  }
+  }, [focusedRouteId]);
 
   function applySelected() {
     const next = {
@@ -263,12 +289,15 @@ export default function MapEditor({ project, setProject }) {
 
   async function reorderFocusedRoute(orderedIds) {
     if (!focusedRouteId) return;
+    setPreview((prev) => ({ ...prev, loading: true }));
     try {
-      const updated = await api.reorderRoute(project.id, focusedRouteId, orderedIds);
+      // Garante que o backend já conhece a atribuição atual antes de validar
+      // a nova ordem (mesmo raciocínio do preview, ver syncAssignments acima).
+      const synced = await syncAssignments();
+      const updated = await api.reorderRoute(synced.id, focusedRouteId, orderedIds);
       setProject(updated);
       // Recalcula o trajeto porque a sequência de paradas mudou.
-      setPreview((prev) => ({ ...prev, loading: true }));
-      const data = await api.previewRoute(project.id, focusedRouteId, project.tipoRota);
+      const data = await api.previewRoute(updated.id, focusedRouteId, updated.tipoRota);
       setPreview({
         loading: false,
         error: null,
@@ -276,21 +305,37 @@ export default function MapEditor({ project, setProject }) {
         waypoints: data.waypoints,
         usedRealRoute: Boolean(data.usedOrs)
       });
-      const map = mapRef.current;
-      if (trajetoLayerRef.current) {
-        map.removeLayer(trajetoLayerRef.current);
-        trajetoLayerRef.current = null;
-      }
-      if (data.coordinates?.length > 1) {
-        const latlngs = data.coordinates.map(([lon, lat]) => [lat, lon]);
-        trajetoLayerRef.current = L.polyline(latlngs, {
-          color: routeColor(focusedRouteId),
-          weight: 4,
-          opacity: 0.85
-        }).addTo(map);
-      }
+      drawTrajeto(data.coordinates);
     } catch (err) {
+      setPreview((prev) => ({ ...prev, loading: false }));
       alert(`Não foi possível salvar a nova ordem: ${err.message}`);
+    }
+  }
+
+  // Ordena automaticamente a rota em foco: começa no colaborador mais distante
+  // do destino e encadeia pelo vizinho mais próximo até o fim (heurística do
+  // vizinho mais próximo). O cálculo é feito no backend, que já tem as
+  // coordenadas de todos os colaboradores.
+  async function autoOrderFocusedRoute(routeId) {
+    if (!routeId) return;
+    setPreview((prev) => ({ ...prev, loading: true }));
+    try {
+      const synced = await syncAssignments();
+      const updated = await api.autoOrderRoute(synced.id, routeId, synced.tipoRota);
+      setProject(updated);
+      const data = await api.previewRoute(updated.id, routeId, updated.tipoRota);
+      setPreview({
+        loading: false,
+        error: null,
+        coordinates: data.coordinates,
+        waypoints: data.waypoints,
+        usedRealRoute: Boolean(data.usedOrs)
+      });
+      const latlngs = drawTrajeto(data.coordinates);
+      if (latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+    } catch (err) {
+      setPreview((prev) => ({ ...prev, loading: false }));
+      alert(`Não foi possível ordenar automaticamente: ${err.message}`);
     }
   }
 
@@ -317,11 +362,7 @@ export default function MapEditor({ project, setProject }) {
   }
 
   async function downloadZip() {
-    const payload = {};
-    project.collaborators.forEach((c) => {
-      payload[c.id] = c.routeId || null;
-    });
-    await api.saveAssignments(project.id, payload);
+    await syncAssignments();
     window.location.href = api.downloadUrl(project.id);
   }
 
@@ -350,6 +391,7 @@ export default function MapEditor({ project, setProject }) {
         onToggleFocusRoute={toggleFocusRoute}
         routeCollaborators={routeCollaborators}
         onReorderRoute={reorderFocusedRoute}
+        onAutoOrderRoute={autoOrderFocusedRoute}
         preview={preview}
       />
     </div>
