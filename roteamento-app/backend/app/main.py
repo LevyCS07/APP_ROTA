@@ -72,6 +72,17 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * radius_km * math.asin(math.sqrt(a))
 
 
+def bearing(lat1, lon1, lat2, lon2):
+    """Direção (0-360°, sentido horário a partir do norte) do ponto 1 para o
+    ponto 2. Usada para agrupar colaboradores que ficam 'do mesmo lado' do
+    destino (bloco 4 - cone/direção do gerador automático)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
 def valid_coordinate(lat, lon):
     return math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
 
@@ -161,6 +172,9 @@ def build_collaborators(df, tipo_rota, destino):
             "lat": lat,
             "lon": lon,
             "distKm": round(haversine(lat, lon, destino["lat"], destino["lon"]), 3),
+            # Direção do destino até o colaborador (0-360°) — usada pelo
+            # gerador automático de rotas para agrupar por região/sentido.
+            "bearing": round(bearing(destino["lat"], destino["lon"], lat, lon), 2),
             "routeId": None,
             # Posição do colaborador na sequência de embarque dentro da rota (0-based).
             # None enquanto o colaborador não pertence a nenhuma rota.
@@ -177,12 +191,275 @@ def ordered_route_rows(project, route_id):
 
 
 def project_response(project):
-    return {key: project[key] for key in ("id", "destino", "tipoRota", "routes", "collaborators")}
+    return {
+        "id": project["id"],
+        "destino": project["destino"],
+        "tipoRota": project["tipoRota"],
+        # .get() com padrão: projetos criados antes desses campos existirem
+        # (dados já salvos no banco) continuam abrindo normalmente.
+        "modo": project.get("modo", "manual"),
+        "veiculo": project.get("veiculo", ""),
+        "routes": project["routes"],
+        "collaborators": project["collaborators"],
+    }
 
 
 def safe_filename(value):
     result = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return result.strip("._")[:80] or "rota"
+
+
+# ---------------------------------------------------------------------------
+# Gerador automático de rotas.
+#
+# Pipeline (cada função abaixo cobre um ou mais blocos do desenho original):
+#   3 Nº de rotas        -> _decide_route_count
+#   4 Cone/Direção        -> bearing() (já calculado em build_collaborators)
+#   5 Pré-agrupamento     -> _split_by_direction
+#   6 Corredor viário      -> aproximado pela própria coerência direcional dos
+#                             grupos (ver nota abaixo; não há dados de malha
+#                             viária disponíveis para um cálculo mais fiel)
+#   7 Rotas candidatas    -> _split_by_direction (1 grupo = 1 rota candidata)
+#   8 Capacidade          -> _rebalance_by_capacity
+#   9 Ordenação           -> _nearest_neighbor_order
+#  10 2-opt               -> _two_opt
+#  11 Roteamento real     -> _evaluate_routes (chama o ORS, reaproveitando
+#                             ors_route) — só 1 chamada por rota já finalizada,
+#                             para não estourar a cota da API a cada iteração
+#  12 Avaliação           -> métricas dentro de _evaluate_routes
+#  13 Trocas/Refinamento  -> _relocate_improvement
+#  14 Validação final     -> feita ao final de auto_generate_routes
+# ---------------------------------------------------------------------------
+
+def _decide_route_count(total, capacity, hint):
+    """Bloco 3: quantas rotas serão necessárias. Usa a dica do usuário se
+    fizer sentido; senão calcula a partir da capacidade do veículo, com uma
+    unidade de folga para dar espaço ao rebalanceamento geográfico."""
+    minimo = max(1, math.ceil(total / capacity))
+    if hint and hint >= minimo:
+        return hint
+    return minimo
+
+
+def _split_by_direction(collaborators, route_count):
+    """Blocos 4+5+7: ordena os colaboradores pela direção (bearing) a partir
+    do destino e fatia em `route_count` setores contíguos de tamanho
+    aproximadamente igual. Colaboradores no mesmo setor angular tendem a sair
+    pelas mesmas vias principais para alcançar o destino — na ausência de um
+    grafo de ruas real, essa coerência direcional é o proxy usado aqui para o
+    'corredor viário' do bloco 6."""
+    ordered = sorted(collaborators, key=lambda c: c["bearing"])
+    total = len(ordered)
+    groups = [[] for _ in range(route_count)]
+    base_size = total / route_count
+    for index, collab in enumerate(ordered):
+        group_index = min(int(index / base_size), route_count - 1)
+        groups[group_index].append(collab)
+    return groups
+
+
+def _rebalance_by_capacity(groups, capacity):
+    """Bloco 8: redistribui colaboradores nas fronteiras entre setores
+    vizinhos (na 'roda' de direções) até que nenhum grupo exceda a
+    capacidade, preservando ao máximo a coerência direcional (só troca com o
+    vizinho mais próximo em ângulo)."""
+    guard = 0
+    changed = True
+    while changed and guard < 500:
+        changed = False
+        guard += 1
+        for i in range(len(groups)):
+            if len(groups[i]) <= capacity:
+                continue
+            groups[i].sort(key=lambda c: c["bearing"])
+            next_i = (i + 1) % len(groups)
+            prev_i = (i - 1) % len(groups)
+            if len(groups[next_i]) < capacity:
+                groups[next_i].append(groups[i].pop())
+                changed = True
+            elif len(groups[prev_i]) < capacity:
+                groups[prev_i].append(groups[i].pop(0))
+                changed = True
+    return groups
+
+
+def _nearest_neighbor_order(rows, destino, lat_key, lon_key):
+    """Bloco 9: sequência inicial de embarque. Começa no colaborador mais
+    distante do destino e, a cada passo, avança para o não visitado mais
+    próximo do atual — mesma heurística usada no botão manual de
+    'ordenar automaticamente' do editor."""
+    remaining = rows.copy()
+    current = max(remaining, key=lambda r: haversine(r[lat_key], r[lon_key], destino["lat"], destino["lon"]))
+    ordered = [current]
+    remaining.remove(current)
+    while remaining:
+        nxt = min(remaining, key=lambda r: haversine(current[lat_key], current[lon_key], r[lat_key], r[lon_key]))
+        ordered.append(nxt)
+        remaining.remove(nxt)
+        current = nxt
+    return ordered
+
+
+def _path_distance(sequence, lat_key, lon_key, destino):
+    total = 0.0
+    for a, b in zip(sequence, sequence[1:]):
+        total += haversine(a[lat_key], a[lon_key], b[lat_key], b[lon_key])
+    if sequence:
+        total += haversine(sequence[-1][lat_key], sequence[-1][lon_key], destino["lat"], destino["lon"])
+    return total
+
+
+def _two_opt(sequence, lat_key, lon_key, destino, max_iterations=60):
+    """Bloco 10: busca local 2-opt clássica sobre distância em linha reta
+    (rota real ainda não existe nesse ponto do pipeline) para desfazer
+    cruzamentos e zigue-zagues óbvios na sequência inicial."""
+    best = sequence
+    n = len(best)
+    if n > 60:
+        # Custo é quadrático por iteração; em rotas muito grandes, uma
+        # passada só já ajuda bastante sem pesar no tempo de resposta.
+        max_iterations = 1
+    improved = True
+    iterations = 0
+    while improved and iterations < max_iterations and n > 3:
+        improved = False
+        iterations += 1
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                candidate = best[:i + 1] + best[i + 1:j + 1][::-1] + best[j + 1:]
+                if _path_distance(candidate, lat_key, lon_key, destino) < _path_distance(best, lat_key, lon_key, destino) - 1e-9:
+                    best = candidate
+                    improved = True
+    return best
+
+
+def _relocate_improvement(routes, collaborators, destino, lat_key, lon_key, passes=3):
+    """Bloco 13: tenta mover colaboradores de fronteira para uma rota vizinha
+    quando isso os aproxima do centro geográfico dessa rota (e há vaga),
+    depois recalcula a sequência de embarque das rotas afetadas."""
+    route_ids = [route["id"] for route in routes]
+    capacity_by_id = {route["id"]: route["capacity"] for route in routes}
+
+    for _ in range(passes):
+        centroids = {}
+        for route_id in route_ids:
+            members = [c for c in collaborators if c["routeId"] == route_id]
+            if members:
+                centroids[route_id] = (
+                    sum(c[lat_key] for c in members) / len(members),
+                    sum(c[lon_key] for c in members) / len(members)
+                )
+        moved_any = False
+        for collab in collaborators:
+            current_id = collab["routeId"]
+            if current_id not in centroids:
+                continue
+            current_dist = haversine(collab[lat_key], collab[lon_key], *centroids[current_id])
+            best_id, best_dist = current_id, current_dist
+            for route_id, centroid in centroids.items():
+                if route_id == current_id:
+                    continue
+                occupancy = sum(1 for c in collaborators if c["routeId"] == route_id)
+                if occupancy >= capacity_by_id.get(route_id, 0):
+                    continue
+                dist = haversine(collab[lat_key], collab[lon_key], *centroid)
+                if dist < best_dist - 0.05:  # só troca se ganhar pelo menos ~50 m, evita "flapping"
+                    best_id, best_dist = route_id, dist
+            if best_id != current_id:
+                collab["routeId"] = best_id
+                moved_any = True
+        if not moved_any:
+            break
+
+    for route_id in route_ids:
+        members = [c for c in collaborators if c["routeId"] == route_id]
+        if not members:
+            continue
+        ordered = _nearest_neighbor_order(members, destino, lat_key, lon_key)
+        ordered = _two_opt(ordered, lat_key, lon_key, destino)
+        for order_index, collab in enumerate(ordered):
+            collab["order"] = order_index
+
+
+def _angular_spread(bearings):
+    """Amplitude angular real de um conjunto de direções (0-360°), tratando
+    corretamente o caso do grupo cruzar a fronteira 0°/360° — a diferença
+    simples entre máximo e mínimo dá um valor errado nesse caso."""
+    if not bearings:
+        return 0.0
+    values = sorted(bearings)
+    gaps = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+    gaps.append(360 - values[-1] + values[0])
+    return round(360 - max(gaps), 1)
+
+
+def _evaluate_routes(routes, collaborators, destino, lat_key, lon_key):
+    """Blocos 11+12: consulta o ORS (mesma função usada no preview/KML) para
+    obter o trajeto real de cada rota já fechada e calcula métricas simples
+    de avaliação (distância, ocupação, dispersão direcional)."""
+    for route in routes:
+        members = [c for c in collaborators if c["routeId"] == route["id"]]
+        members.sort(key=lambda c: c["order"] if c["order"] is not None else 0)
+        if not members:
+            route.update(distanciaKm=0.0, usedOrs=False, ocupacao=0, dispersaoGraus=0.0)
+            continue
+        coords = [[m[lon_key], m[lat_key]] for m in members] + [[destino["lon"], destino["lat"]]]
+        route_coords, used_ors = ors_route(coords)
+        distancia_km = sum(
+            haversine(lat1, lon1, lat2, lon2)
+            for (lon1, lat1), (lon2, lat2) in zip(route_coords, route_coords[1:])
+        )
+        route.update(
+            distanciaKm=round(distancia_km, 2),
+            usedOrs=used_ors,
+            ocupacao=len(members),
+            dispersaoGraus=_angular_spread([m["bearing"] for m in members]),
+        )
+    return routes
+
+
+def auto_generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rota):
+    """Executa o pipeline completo (blocos 3 a 14) e devolve a lista de
+    rotas já povoadas; `collaborators` é alterado em memória (routeId/order
+    de cada colaborador são preenchidos diretamente nos dicionários)."""
+    total = len(collaborators)
+    if total == 0:
+        return [{"id": 1, "name": "ROTA_01", "capacity": capacity}]
+
+    lat_key, lon_key = ("latE", "lonE") if tipo_rota == "Entrada" else ("latS", "lonS")
+
+    route_count = _decide_route_count(total, capacity, route_count_hint)
+    groups = _split_by_direction(collaborators, route_count)
+    groups = _rebalance_by_capacity(groups, capacity)
+
+    routes = []
+    for index, group in enumerate(groups):
+        if not group:
+            continue
+        route_id = index + 1
+        routes.append({"id": route_id, "name": f"ROTA_{route_id:02d}", "capacity": capacity})
+        ordered_group = _nearest_neighbor_order(group, destino, lat_key, lon_key)
+        ordered_group = _two_opt(ordered_group, lat_key, lon_key, destino)
+        for order_index, collab in enumerate(ordered_group):
+            collab["routeId"] = route_id
+            collab["order"] = order_index
+
+    _relocate_improvement(routes, collaborators, destino, lat_key, lon_key, passes=3)
+
+    # 14) Validação final: remove rotas que ficaram vazias após os ajustes e
+    # renumera a ordem de embarque de 0..n-1 sem buracos.
+    routes = [route for route in routes if any(c["routeId"] == route["id"] for c in collaborators)]
+    for route in routes:
+        members = [c for c in collaborators if c["routeId"] == route["id"]]
+        members.sort(key=lambda c: c["order"] if c["order"] is not None else 0)
+        for order_index, collab in enumerate(members):
+            collab["order"] = order_index
+    if not routes:
+        routes = [{"id": 1, "name": "ROTA_01", "capacity": capacity}]
+
+    return _evaluate_routes(routes, collaborators, destino, lat_key, lon_key)
 
 
 @app.on_event("startup")
@@ -196,26 +473,51 @@ def health():
 
 
 @app.post("/api/projects")
-async def create_project(file: UploadFile = File(...), destino_lat: float = Form(...), destino_lon: float = Form(...), tipo_rota: str = Form("Entrada"), capacidades: str = Form("[22]")):
+async def create_project(
+    file: UploadFile = File(...),
+    destino_lat: float = Form(...),
+    destino_lon: float = Form(...),
+    tipo_rota: str = Form("Entrada"),
+    modo: str = Form("manual"),
+    capacidade: int = Form(22),
+    quantidade_rotas: int = Form(0),
+    veiculo: str = Form(""),
+):
     if tipo_rota not in TIPOS_ROTA:
         raise HTTPException(422, "tipo_rota deve ser 'Entrada' ou 'Saída'.")
+    if modo not in {"manual", "automatico"}:
+        raise HTTPException(422, "modo deve ser 'manual' ou 'automatico'.")
     if not valid_coordinate(destino_lat, destino_lon):
         raise HTTPException(422, "Coordenadas de destino inválidas.")
+    if capacidade < 1:
+        raise HTTPException(422, "A capacidade deve ser maior que zero.")
+    if quantidade_rotas < 0:
+        raise HTTPException(422, "A quantidade de rotas não pode ser negativa.")
     if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
         raise HTTPException(400, "Envie um arquivo .xlsx ou .xls.")
     contents = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "O arquivo excede o limite de 15 MB.")
-    try:
-        caps = json.loads(capacidades)
-        if not isinstance(caps, list) or not caps or any(isinstance(cap, bool) or int(cap) < 1 for cap in caps):
-            raise ValueError
-        caps = [int(cap) for cap in caps]
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(422, "capacidades deve ser uma lista JSON de inteiros positivos.") from exc
+
     df = read_excel(contents)
     destino = {"lat": float(destino_lat), "lon": float(destino_lon)}
-    project = {"id": str(uuid.uuid4()), "destino": destino, "tipoRota": tipo_rota, "routes": [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacity} for index, capacity in enumerate(caps)], "collaborators": build_collaborators(df, tipo_rota, destino)}
+    collaborators = build_collaborators(df, tipo_rota, destino)
+
+    if modo == "automatico":
+        routes = auto_generate_routes(collaborators, destino, capacidade, quantidade_rotas or None, tipo_rota)
+    else:
+        route_count = quantidade_rotas if quantidade_rotas > 0 else 5
+        routes = [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacidade} for index in range(route_count)]
+
+    project = {
+        "id": str(uuid.uuid4()),
+        "destino": destino,
+        "tipoRota": tipo_rota,
+        "modo": modo,
+        "veiculo": veiculo.strip()[:60],
+        "routes": routes,
+        "collaborators": collaborators,
+    }
     save_project(project)
     return project_response(project)
 
@@ -359,17 +661,7 @@ def auto_order_route(project_id: str, route_id: int, tipo: str = "Entrada"):
 
     lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
     destino = project["destino"]
-
-    remaining = rows.copy()
-    # Ponto de partida: o colaborador mais distante do destino.
-    current = max(remaining, key=lambda row: haversine(row[lat_key], row[lon_key], destino["lat"], destino["lon"]))
-    ordered = [current]
-    remaining.remove(current)
-    while remaining:
-        nxt = min(remaining, key=lambda row: haversine(current[lat_key], current[lon_key], row[lat_key], row[lon_key]))
-        ordered.append(nxt)
-        remaining.remove(nxt)
-        current = nxt
+    ordered = _nearest_neighbor_order(rows, destino, lat_key, lon_key)
 
     for index, row in enumerate(ordered):
         row["order"] = index
