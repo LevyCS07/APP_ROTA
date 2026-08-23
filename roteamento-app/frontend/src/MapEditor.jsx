@@ -33,6 +33,12 @@ function pointIcon(routeId, { selected = false, order = null } = {}) {
 
 const EMPTY_PREVIEW = { loading: false, error: null, coordinates: [], waypoints: [], usedRealRoute: false };
 
+// Serializa apenas o routeId de cada colaborador, para comparar "o que está
+// salvo no servidor" com "o que está na tela" (ver estado `dirty`).
+function snapshotAssignments(project) {
+  return project.collaborators.map((c) => `${c.id}:${c.routeId ?? ''}`).sort().join('|');
+}
+
 export default function MapEditor({ project, setProject }) {
   const mapRef = useRef(null);
   const layerRef = useRef(null);
@@ -52,11 +58,34 @@ export default function MapEditor({ project, setProject }) {
   // Espelha selectingRef em estado só para dar feedback visual no botão
   // "Selecionar área" (o ref sozinho é o que os handlers do mapa usam de fato).
   const [selecting, setSelecting] = useState(false);
+  // Melhoria: indica se há atribuições feitas na tela que ainda não foram
+  // confirmadas no backend (ex.: "Atribuir" sem depois clicar em "Salvar
+  // edições"), para mostrar um aviso perto do botão de salvar.
+  const [dirty, setDirty] = useState(false);
+  const savedSnapshotRef = useRef(snapshotAssignments(project));
 
   function setSelectMode(value) {
     selectingRef.current = value;
     setSelecting(value);
   }
+
+  // Melhoria: tecla Esc cancela o modo "Selecionar área" a qualquer momento,
+  // inclusive no meio de um arrasto em andamento.
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (e.key !== 'Escape' || !selectingRef.current) return;
+      const map = mapRef.current;
+      if (rectangleRef.current && map) {
+        map.removeLayer(rectangleRef.current);
+        rectangleRef.current = null;
+        map.dragging.enable();
+      }
+      selectStartRef.current = null;
+      setSelectMode(false);
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   // Mapa de colaboradorId -> posição na sequência de embarque, para a rota em foco.
   const orderByCollabId = new Map(
@@ -185,8 +214,8 @@ export default function MapEditor({ project, setProject }) {
   }, [project, hiddenRoutes]);
 
   // Envia ao backend o estado atual de atribuição de rotas (routeId de cada
-  // colaborador). Ações como "Adicionar selecionados" só mudam o estado local
-  // no navegador — sem isso, o servidor fica com uma versão desatualizada do
+  // colaborador). Ações como "Atribuir" só mudam o estado local no
+  // navegador — sem isso, o servidor fica com uma versão desatualizada do
   // projeto, e endpoints que dependem dela (preview de trajeto, reordenar
   // embarque) passam a rejeitar os dados por não baterem com o que já foi
   // salvo. Por isso ela é chamada automaticamente antes dessas ações, além de
@@ -196,7 +225,10 @@ export default function MapEditor({ project, setProject }) {
     nextProject.collaborators.forEach((c) => {
       payload[c.id] = c.routeId || null;
     });
-    return api.saveAssignments(project.id, payload);
+    const updated = await api.saveAssignments(project.id, payload);
+    savedSnapshotRef.current = snapshotAssignments(updated);
+    setDirty(false);
+    return updated;
   }
 
   async function saveAssignments(nextProject = project) {
@@ -274,6 +306,7 @@ export default function MapEditor({ project, setProject }) {
     };
     setSelected(new Set());
     setProject(next);
+    setDirty(snapshotAssignments(next) !== savedSnapshotRef.current);
   }
 
   function toggleHiddenRoute(routeId) {
@@ -300,12 +333,9 @@ export default function MapEditor({ project, setProject }) {
     if (!focusedRouteId) return;
     setPreview((prev) => ({ ...prev, loading: true }));
     try {
-      // Garante que o backend já conhece a atribuição atual antes de validar
-      // a nova ordem (mesmo raciocínio do preview, ver syncAssignments acima).
       const synced = await syncAssignments();
       const updated = await api.reorderRoute(synced.id, focusedRouteId, orderedIds);
       setProject(updated);
-      // Recalcula o trajeto porque a sequência de paradas mudou.
       const data = await api.previewRoute(updated.id, focusedRouteId, updated.tipoRota);
       setPreview({
         loading: false,
@@ -353,7 +383,17 @@ export default function MapEditor({ project, setProject }) {
     setProject(await api.addRoute(project.id, capacity));
   }
 
+  // Melhoria: confirma antes de remover uma rota que ainda tem colaboradores,
+  // já que eles voltam para "sem rota" imediatamente e isso não pode ser desfeito.
   async function removeRoute(routeId) {
+    const route = project.routes.find((item) => item.id === routeId);
+    const count = project.collaborators.filter((c) => c.routeId === routeId).length;
+    if (count > 0) {
+      const ok = window.confirm(
+        `A rota "${route?.name || routeId}" tem ${count} colaborador(es). Remover mesmo assim? Eles ficarão sem rota.`
+      );
+      if (!ok) return;
+    }
     if (focusedRouteId === routeId) setFocusedRouteId(null);
     const updated = await api.removeRoute(project.id, routeId);
     setProject(updated);
@@ -393,6 +433,7 @@ export default function MapEditor({ project, setProject }) {
         onAddRoute={addRoute}
         onSaveAssignments={() => saveAssignments()}
         onDownloadZip={downloadZip}
+        dirty={dirty}
         hiddenRoutes={hiddenRoutes}
         onToggleHiddenRoute={toggleHiddenRoute}
         onRemoveRoute={removeRoute}

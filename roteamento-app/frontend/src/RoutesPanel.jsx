@@ -26,7 +26,8 @@ export default function RoutesPanel({
   routeCollaborators,
   onReorderRoute,
   onAutoOrderRoute,
-  preview
+  preview,
+  dirty
 }) {
   const counts = project.routes.map((route) => ({
     ...route,
@@ -81,7 +82,7 @@ export default function RoutesPanel({
           </div>
 
           <div className="routes-list">
-            <div className="route-row sem-rota">
+            <div className={`route-row sem-rota ${semRota > 0 ? 'alert' : ''}`}>
               <span>Sem rota</span>
               <strong>{semRota}</strong>
             </div>
@@ -98,6 +99,12 @@ export default function RoutesPanel({
                     <span>{route.name}</span>
                     <strong>{route.count}/{route.capacity}</strong>
                   </div>
+                  {typeof route.distanciaKm === 'number' && (
+                    <p className="route-meta">
+                      ≈{route.distanciaKm} km{route.usedOrs ? '' : ' (linha reta)'}
+                      {typeof route.dispersaoGraus === 'number' ? ` · dispersão ${route.dispersaoGraus}°` : ''}
+                    </p>
+                  )}
 
                   <label className="capacity-field">Cap.
                     <input
@@ -162,8 +169,11 @@ export default function RoutesPanel({
       </div>
 
       <div className="panel-footer">
-        <button className="secondary" onClick={onSaveAssignments}>Salvar edições</button>
-        <button className="primary" onClick={onDownloadZip}>Baixar KMLs e relatório</button>
+        {dirty && <p className="unsaved-note">Alterações não salvas</p>}
+        <div className="footer-buttons">
+          <button className="secondary" onClick={onSaveAssignments}>Salvar edições</button>
+          <button className="primary" onClick={onDownloadZip}>Baixar KMLs e relatório</button>
+        </div>
       </div>
     </aside>
   );
