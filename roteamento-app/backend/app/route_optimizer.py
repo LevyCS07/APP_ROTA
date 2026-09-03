@@ -36,6 +36,13 @@ MAX_WAYPOINTS = 48       # Limite de waypoints por chamada de directions (inclui
 MATRIX_MAX_POINTS = 55   # Limite prático da Matrix API no plano gratuito do ORS.
 INVALID_PENALTY = 100_000.0  # Penalidade (finita) para rotas que violam uma restrição "dura".
 
+# Em 2026 o HeiGIT descontinuou api.openrouteservice.org em favor de uma URL
+# unificada para todos os serviços deles. A lib openrouteservice-py usa o
+# domínio antigo por padrão (parâmetro base_url do Client), então precisamos
+# apontar explicitamente para o novo. Configurável via env var para não
+# precisar mexer no código numa eventual próxima migração.
+ORS_BASE_URL = os.getenv("ORS_BASE_URL", "https://api.heigit.org/openrouteservice")
+
 # Cache de consultas ao ORS neste processo (regra 9 do prompt: evitar
 # chamadas repetidas para o mesmo conjunto de pontos). É intencionalmente
 # em memória e não persistido — o processo já é efêmero no Render.
@@ -165,7 +172,7 @@ def ors_route(coords):
         result = _fallback_route(coords)
     else:
         try:
-            client = openrouteservice.Client(key=api_key, timeout=15)
+            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=15)
             # optimize_waypoints deliberadamente OMITIDO: a ordem já foi
             # decidida pelo algoritmo (cones + Savings/NN + 2-opt) e deve
             # ser respeitada, não reotimizada pelo ORS.
@@ -211,7 +218,7 @@ def ors_matrix(locations):
         result = _fallback_matrix(locations)
     else:
         try:
-            client = openrouteservice.Client(key=api_key, timeout=20)
+            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=20)
             response = client.distance_matrix(locations=locations, profile="driving-car", metrics=["duration", "distance"])
             durations_min = [[(v or 0) / 60 for v in row] for row in response["durations"]]
             distances_km = [[(v or 0) / 1000 for v in row] for row in response["distances"]]
@@ -226,12 +233,20 @@ def ors_matrix(locations):
 class CostContext:
     """Fornece custos de deslocamento (duração em min / distância em km)
     entre colaboradores e até o destino, usando a Matrix API do ORS quando
-    o grupo cabe no limite prático, com cache e fallback por linha reta."""
+    o grupo cabe no limite prático, com cache e fallback por linha reta.
 
-    def __init__(self, members, destino, lat_key, lon_key):
+    `hints` (opcional): pistas do histórico (`knowledge_base.HistoricalHints`)
+    que ajustam o custo ENTRE COLABORADORES (nunca até o destino, que é pura
+    geografia) para favorecer combinações que o usuário historicamente
+    manteve juntas, e desfavorecer as que ele historicamente separou. É um
+    ajuste de busca, não uma verdade absoluta — por isso as métricas finais
+    reportadas (distanciaKm/duracaoMin) nunca usam esse ajuste."""
+
+    def __init__(self, members, destino, lat_key, lon_key, hints=None):
         self.destino = destino
         self.lat_key = lat_key
         self.lon_key = lon_key
+        self.hints = hints
         self.duration_matrix = None
         self.distance_matrix = None
         self.id_to_index = None
@@ -241,17 +256,24 @@ class CostContext:
             self.duration_matrix, self.distance_matrix, self.used_ors = ors_matrix(locations)
             self.id_to_index = {m["id"]: idx for idx, m in enumerate(members)}
 
+    def _hint_factor(self, a, b):
+        if not self.hints or self.hints.is_empty():
+            return 1.0
+        return self.hints.factor(a[self.lat_key], a[self.lon_key], b[self.lat_key], b[self.lon_key])
+
     def duration(self, a, b):
         if self.duration_matrix is not None and a["id"] in self.id_to_index and b["id"] in self.id_to_index:
-            return self.duration_matrix[self.id_to_index[a["id"]]][self.id_to_index[b["id"]]]
-        _, dur = _fallback_pair_cost(a[self.lat_key], a[self.lon_key], b[self.lat_key], b[self.lon_key])
-        return dur
+            base = self.duration_matrix[self.id_to_index[a["id"]]][self.id_to_index[b["id"]]]
+        else:
+            _, base = _fallback_pair_cost(a[self.lat_key], a[self.lon_key], b[self.lat_key], b[self.lon_key])
+        return base * self._hint_factor(a, b)
 
     def distance(self, a, b):
         if self.distance_matrix is not None and a["id"] in self.id_to_index and b["id"] in self.id_to_index:
-            return self.distance_matrix[self.id_to_index[a["id"]]][self.id_to_index[b["id"]]]
-        dist, _ = _fallback_pair_cost(a[self.lat_key], a[self.lon_key], b[self.lat_key], b[self.lon_key])
-        return dist
+            base = self.distance_matrix[self.id_to_index[a["id"]]][self.id_to_index[b["id"]]]
+        else:
+            base, _ = _fallback_pair_cost(a[self.lat_key], a[self.lon_key], b[self.lat_key], b[self.lon_key])
+        return base * self._hint_factor(a, b)
 
     def to_destino(self, a):
         if self.duration_matrix is not None and a["id"] in self.id_to_index:
@@ -601,7 +623,7 @@ def clarke_wright_savings(members, destino, capacity, ctx, max_route_time=None):
 # Etapa 3: refinamento — relocate por custo marginal (regras 5, 6, 10)
 # ---------------------------------------------------------------------------
 
-def _apply_relocate(groups, destino, capacity, lat_key, lon_key, config):
+def _apply_relocate(groups, destino, capacity, lat_key, lon_key, config, hints=None):
     """Tenta mover colaboradores de fronteira entre grupos vizinhos (por
     direção média) quando isso melhora o CUSTO TOTAL da solução — avaliado
     pela mesma `avaliar_rota()` usada em todo o resto do sistema — e não
@@ -627,7 +649,7 @@ def _apply_relocate(groups, destino, capacity, lat_key, lon_key, config):
             group_a, group_b = groups[i], groups[j]
             if not group_a and not group_b:
                 continue
-            ctx = CostContext(group_a + group_b, destino, lat_key, lon_key)
+            ctx = CostContext(group_a + group_b, destino, lat_key, lon_key, hints)
 
             for from_group, to_group, to_has_room in (
                 (group_a, group_b, len(group_b) < capacity),
@@ -658,7 +680,7 @@ def _apply_relocate(groups, destino, capacity, lat_key, lon_key, config):
     for group in groups:
         if not group:
             continue
-        ctx = CostContext(group, destino, lat_key, lon_key)
+        ctx = CostContext(group, destino, lat_key, lon_key, hints)
         ordered = nearest_neighbor_order(group, destino, lat_key, lon_key)
         ordered = _two_opt(ordered, ctx)
         refined.append(ordered)
@@ -669,24 +691,24 @@ def _apply_relocate(groups, destino, capacity, lat_key, lon_key, config):
 # Construção das 3 estratégias concorrentes (regra 8) e finalização
 # ---------------------------------------------------------------------------
 
-def _build_strategy_nn(groups, destino, lat_key, lon_key):
+def _build_strategy_nn(groups, destino, lat_key, lon_key, hints=None):
     routes = []
     for group in groups:
         if not group:
             continue
-        ctx = CostContext(group, destino, lat_key, lon_key)
+        ctx = CostContext(group, destino, lat_key, lon_key, hints)
         ordered = nearest_neighbor_order(group, destino, lat_key, lon_key)
         ordered = _two_opt(ordered, ctx)
         routes.append(ordered)
     return routes
 
 
-def _build_strategy_savings(groups, destino, capacity, lat_key, lon_key, config):
+def _build_strategy_savings(groups, destino, capacity, lat_key, lon_key, config, hints=None):
     routes = []
     for group in groups:
         if not group:
             continue
-        ctx = CostContext(group, destino, lat_key, lon_key)
+        ctx = CostContext(group, destino, lat_key, lon_key, hints)
         sub_routes = clarke_wright_savings(group, destino, capacity, ctx, max_route_time=config.tempo_limite_min)
         for sub in sub_routes:
             routes.append(_two_opt(sub, ctx))
@@ -766,12 +788,17 @@ def _copy_groups(groups):
     return [[dict(m) for m in g] for g in groups]
 
 
-def generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rota, config=None):
+def generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rota, config=None, hints=None):
     """Ponto de entrada principal: executa o pipeline completo e devolve a
     lista de rotas da MELHOR entre 3 estratégias concorrentes (regra 8),
     todas avaliadas pela mesma função de custo. `collaborators` é alterado
     em memória (routeId/order de cada colaborador são preenchidos
-    diretamente nos dicionários originais)."""
+    diretamente nos dicionários originais).
+
+    `hints` (opcional): um `knowledge_base.HistoricalHints` com conexões
+    fortes/penalizações aprendidas de gerações anteriores — usado apenas
+    para ORIENTAR a construção/sequenciamento (nunca para violar capacidade
+    ou o limite de tempo, e nunca para maquiar as métricas finais)."""
     config = config or OptimizerConfig()
     total = len(collaborators)
     if total == 0:
@@ -788,16 +815,16 @@ def generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rot
 
     # Estratégia 1: Cones + Nearest Neighbor + 2-opt.
     groups_nn = _copy_groups(base_groups)
-    candidatos["cones_nn_2opt"] = _build_strategy_nn(groups_nn, destino, lat_key, lon_key)
+    candidatos["cones_nn_2opt"] = _build_strategy_nn(groups_nn, destino, lat_key, lon_key, hints)
 
     # Estratégia 2: Cones + Savings + 2-opt.
     groups_savings = _copy_groups(base_groups)
-    candidatos["cones_savings_2opt"] = _build_strategy_savings(groups_savings, destino, capacity, lat_key, lon_key, config)
+    candidatos["cones_savings_2opt"] = _build_strategy_savings(groups_savings, destino, capacity, lat_key, lon_key, config, hints)
 
     # Estratégia 3: Cones + Savings + 2-opt + refinamento (relocate).
     groups_savings_refino = _copy_groups(base_groups)
-    groups_savings_refino = _apply_relocate(groups_savings_refino, destino, capacity, lat_key, lon_key, config)
-    candidatos["cones_savings_2opt_refino"] = _build_strategy_savings(groups_savings_refino, destino, capacity, lat_key, lon_key, config)
+    groups_savings_refino = _apply_relocate(groups_savings_refino, destino, capacity, lat_key, lon_key, config, hints)
+    candidatos["cones_savings_2opt_refino"] = _build_strategy_savings(groups_savings_refino, destino, capacity, lat_key, lon_key, config, hints)
 
     melhor_nome, melhor_routes, melhor_membros, melhor_custo = None, None, None, math.inf
     for nome, route_lists in candidatos.items():
