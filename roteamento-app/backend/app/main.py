@@ -17,7 +17,7 @@ from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
 
-import route_optimizer as optimizer
+from . import route_optimizer as optimizer
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
