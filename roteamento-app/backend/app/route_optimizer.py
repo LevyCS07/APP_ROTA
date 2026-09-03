@@ -27,10 +27,13 @@ Limitações conhecidas (documentadas em vez de escondidas):
     (`MATRIX_MAX_POINTS`); grupos maiores que isso caem no fallback estimado.
 """
 
+import logging
 import math
 import os
 
 import openrouteservice
+
+logger = logging.getLogger("route_optimizer")
 
 MAX_WAYPOINTS = 48       # Limite de waypoints por chamada de directions (inclui o destino).
 MATRIX_MAX_POINTS = 55   # Limite prático da Matrix API no plano gratuito do ORS.
@@ -168,7 +171,11 @@ def ors_route(coords):
         return _ROUTE_CACHE[key]
 
     api_key = os.getenv("ORS_API_KEY")
-    if not api_key or len(coords) > MAX_WAYPOINTS:
+    if not api_key:
+        logger.warning("ORS_API_KEY não configurada — usando fallback por linha reta.")
+        result = _fallback_route(coords)
+    elif len(coords) > MAX_WAYPOINTS:
+        logger.warning("ors_route: %d pontos excede MAX_WAYPOINTS=%d — usando fallback.", len(coords), MAX_WAYPOINTS)
         result = _fallback_route(coords)
     else:
         try:
@@ -180,7 +187,11 @@ def ors_route(coords):
             feature = response["features"][0]
             summary = feature["properties"]["summary"]
             result = (feature["geometry"]["coordinates"], summary["distance"] / 1000, summary["duration"] / 60, True)
-        except Exception:
+        except Exception as exc:
+            # Loga o motivo real (aparece nos logs do Render) em vez de
+            # engolir silenciosamente — essencial pra diagnosticar cota
+            # excedida, chave inválida, timeout, mudança de URL, etc.
+            logger.warning("ORS directions() falhou (%s: %s) — usando fallback por linha reta.", type(exc).__name__, exc)
             result = _fallback_route(coords)
 
     _ROUTE_CACHE[key] = result
@@ -223,7 +234,8 @@ def ors_matrix(locations):
             durations_min = [[(v or 0) / 60 for v in row] for row in response["durations"]]
             distances_km = [[(v or 0) / 1000 for v in row] for row in response["distances"]]
             result = (durations_min, distances_km, True)
-        except Exception:
+        except Exception as exc:
+            logger.warning("ORS distance_matrix() falhou (%s: %s) — usando fallback por linha reta.", type(exc).__name__, exc)
             result = _fallback_matrix(locations)
 
     _MATRIX_CACHE[key] = result
