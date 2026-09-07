@@ -17,8 +17,16 @@ from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
 
-import route_optimizer as optimizer
-import knowledge_base as kb
+# Import compatível tanto com "uvicorn app.main:app" (produção — main.py é
+# carregado como parte do pacote `app`, então precisa de import relativo)
+# quanto com execução/teste direto do módulo (onde não há pacote pai, e o
+# import relativo falharia com "attempted relative import").
+try:
+    from . import route_optimizer as optimizer
+    from . import knowledge_base as kb
+except ImportError:
+    import route_optimizer as optimizer
+    import knowledge_base as kb
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
