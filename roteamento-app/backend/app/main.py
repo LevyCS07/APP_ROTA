@@ -17,7 +17,8 @@ from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
 
-from . import route_optimizer as optimizer
+import route_optimizer as optimizer
+import knowledge_base as kb
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
@@ -259,10 +260,21 @@ async def create_project(
             meta_ocupacao=meta_ocupacao,
             tempo_limite_min=limite_minutos,
         )
-        routes = optimizer.generate_routes(collaborators, destino, capacidade, quantidade_rotas or None, tipo_rota, config)
+        lat_key = "latE" if tipo_rota == "Entrada" else "latS"
+        lon_key = "lonE" if tipo_rota == "Entrada" else "lonS"
+        # Best-effort: se o Supabase não estiver configurado ou a busca
+        # falhar, fetch_hints devolve um HistoricalHints vazio (sem nenhum
+        # efeito no algoritmo) — nunca interrompe a geração.
+        hints = kb.fetch_hints(collaborators, lat_key, lon_key)
+        routes = optimizer.generate_routes(collaborators, destino, capacidade, quantidade_rotas or None, tipo_rota, config, hints)
+        # Guarda a sugestão original para comparação posterior (feedback
+        # loop): ao exportar, comparamos o estado atual com este snapshot
+        # para saber se o usuário aceitou a sugestão ou a ajustou.
+        sugestao_original = {c["id"]: c["routeId"] for c in collaborators}
     else:
         route_count = quantidade_rotas if quantidade_rotas > 0 else 5
         routes = [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacidade} for index in range(route_count)]
+        sugestao_original = None
 
     project = {
         "id": str(uuid.uuid4()),
@@ -275,6 +287,9 @@ async def create_project(
         "limiteMinutos": limite_minutos,
         "routes": routes,
         "collaborators": collaborators,
+        # Uso interno (feedback loop) — nunca exposto pelo project_response.
+        "sugestaoOriginal": sugestao_original,
+        "conhecimentoRegistrado": False,
     }
     save_project(project)
     return project_response(project)
@@ -497,4 +512,29 @@ def download(project_id: str):
         pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
         zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
     archive.seek(0)
+
+    # Registra na base de conhecimento (best-effort — nunca atrasa nem
+    # quebra o download se o Supabase estiver fora ou não configurado). O
+    # download é o sinal de "isso está pronto/final" usado para decidir se
+    # a sugestão automática foi aceita ou ajustada (regra 6.6 do "Cérebro").
+    _register_knowledge(project)
+
     return StreamingResponse(archive, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="rotas_kml_relatorio.zip"'})
+
+
+def _register_knowledge(project):
+    if not kb.is_enabled():
+        return
+    try:
+        lat_key = "latE" if project["tipoRota"] == "Entrada" else "latS"
+        lon_key = "lonE" if project["tipoRota"] == "Entrada" else "lonS"
+        if project.get("modo") == "automatico":
+            kb.register_feedback(project, project.get("sugestaoOriginal"), lat_key, lon_key)
+        else:
+            kb.save_scenario(project, "MANUAL_VALIDADA", peso=1.0)
+        project["conhecimentoRegistrado"] = True
+        save_project(project)
+    except Exception:
+        # Nunca deixa um problema na base de conhecimento atrapalhar o
+        # download — o pior caso é só não aprendermos com esse cenário.
+        pass
