@@ -201,6 +201,10 @@ def project_response(project):
         "limiteMinutos": project.get("limiteMinutos", 90),
         "routes": project["routes"],
         "collaborators": project["collaborators"],
+        # Permite o frontend decidir se mostra o botão "Salvar no histórico"
+        # (a base de conhecimento é opcional — ver _register_knowledge).
+        "conhecimentoDisponivel": kb.is_enabled(),
+        "conhecimentoRegistrado": project.get("conhecimentoRegistrado", False),
     }
 
 
@@ -520,29 +524,30 @@ def download(project_id: str):
         pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
         zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
     archive.seek(0)
-
-    # Registra na base de conhecimento (best-effort — nunca atrasa nem
-    # quebra o download se o Supabase estiver fora ou não configurado). O
-    # download é o sinal de "isso está pronto/final" usado para decidir se
-    # a sugestão automática foi aceita ou ajustada (regra 6.6 do "Cérebro").
-    _register_knowledge(project)
-
     return StreamingResponse(archive, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="rotas_kml_relatorio.zip"'})
 
 
-def _register_knowledge(project):
+@app.post("/api/projects/{project_id}/save-to-knowledge-base")
+def save_to_knowledge_base(project_id: str):
+    """Persistência OPCIONAL: o usuário decide, com um clique explícito no
+    editor, se quer que essa geração alimente a base de conhecimento do
+    Supabase. Diferente de antes, isso NÃO acontece mais automaticamente
+    no download — só quando chamado aqui."""
     if not kb.is_enabled():
-        return
-    try:
-        lat_key = "latE" if project["tipoRota"] == "Entrada" else "latS"
-        lon_key = "lonE" if project["tipoRota"] == "Entrada" else "lonS"
-        if project.get("modo") == "automatico":
-            kb.register_feedback(project, project.get("sugestaoOriginal"), lat_key, lon_key)
-        else:
-            kb.save_scenario(project, "MANUAL_VALIDADA", peso=1.0)
-        project["conhecimentoRegistrado"] = True
-        save_project(project)
-    except Exception:
-        # Nunca deixa um problema na base de conhecimento atrapalhar o
-        # download — o pior caso é só não aprendermos com esse cenário.
-        pass
+        raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
+    project = load_project(project_id)
+    lat_key = "latE" if project["tipoRota"] == "Entrada" else "latS"
+    lon_key = "lonE" if project["tipoRota"] == "Entrada" else "lonS"
+
+    if project.get("modo") == "automatico":
+        tipo_origem = kb.register_feedback(project, project.get("sugestaoOriginal"), lat_key, lon_key)
+    else:
+        tipo_origem = "MANUAL_VALIDADA"
+        kb.save_scenario(project, tipo_origem, peso=1.0)
+
+    if tipo_origem is None:
+        raise HTTPException(502, "Não foi possível salvar no Supabase agora. Confira os logs do backend.")
+
+    project["conhecimentoRegistrado"] = True
+    save_project(project)
+    return {"tipoOrigem": tipo_origem}
