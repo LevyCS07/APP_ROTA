@@ -1,8 +1,5 @@
+import { useState } from 'react';
 import RouteOrderList from './RouteOrderList.jsx';
-
-function routeColorFor(routeId, routeColor) {
-  return routeColor(routeId);
-}
 
 export default function RoutesPanel({
   project,
@@ -17,23 +14,39 @@ export default function RoutesPanel({
   onAddRoute,
   onSaveAssignments,
   onDownloadZip,
+  onSaveToKnowledgeBase,
+  savingKnowledge,
+  dirty,
   hiddenRoutes,
   onToggleHiddenRoute,
   onRemoveRoute,
   onUpdateRouteCapacity,
-  focusedRouteId,
-  onToggleFocusRoute,
+  selectedRouteId,
+  editingRouteId,
+  onSelectRoute,
+  onToggleEditing,
   routeCollaborators,
   onReorderRoute,
   onAutoOrderRoute,
-  preview,
-  dirty
+  preview
 }) {
-  const counts = project.routes.map((route) => ({
+  // Seletor de rotas pesquisável — essencial quando há muitas rotas geradas
+  // automaticamente e o usuário quer achar uma específica rápido.
+  const [routeSearch, setRouteSearch] = useState('');
+
+  const allCounts = project.routes.map((route) => ({
     ...route,
     count: project.collaborators.filter((c) => c.routeId === route.id).length
   }));
+  const query = routeSearch.trim().toLowerCase();
+  const visibleCounts = query ? allCounts.filter((route) => route.name.toLowerCase().includes(query)) : allCounts;
   const semRota = project.collaborators.filter((c) => !c.routeId).length;
+
+  const knowledgeLabel = savingKnowledge
+    ? 'Salvando no histórico...'
+    : project.conhecimentoRegistrado
+      ? '✓ Salvo — salvar de novo'
+      : 'Salvar esta geração no histórico';
 
   return (
     <aside className="panel">
@@ -81,89 +94,115 @@ export default function RoutesPanel({
             <button type="button" className="add-route-pill" onClick={onAddRoute}>+ Nova rota</button>
           </div>
 
-          <div className="routes-list">
-            <div className={`route-row sem-rota ${semRota > 0 ? 'alert' : ''}`}>
-              <span>Sem rota</span>
-              <strong>{semRota}</strong>
-            </div>
+          <input
+            type="search"
+            className="route-search"
+            placeholder={`Buscar entre ${allCounts.length} rota${allCounts.length === 1 ? '' : 's'}...`}
+            value={routeSearch}
+            onChange={(e) => setRouteSearch(e.target.value)}
+          />
 
-            {counts.map((route) => {
-              const isFocused = focusedRouteId === route.id;
+          <div className="routes-list">
+            {!query && (
+              <div className={`route-row sem-rota ${semRota > 0 ? 'alert' : ''}`}>
+                <span>Sem rota</span>
+                <strong>{semRota}</strong>
+              </div>
+            )}
+
+            {visibleCounts.map((route) => {
+              const isSelected = selectedRouteId === route.id;
+              const isEditing = editingRouteId === route.id;
               return (
                 <div
-                  className={`route-row ${hiddenRoutes.has(route.id) ? 'hidden-route' : ''}`}
+                  className={`route-row compact ${hiddenRoutes.has(route.id) ? 'hidden-route' : ''} ${isSelected ? 'selected' : ''}`}
                   key={route.id}
-                  style={{ borderLeftColor: routeColorFor(route.id, routeColor) }}
+                  style={{ borderLeftColor: routeColor(route.id) }}
                 >
-                  <div className="route-main">
+                  <button type="button" className="route-row-main" onClick={() => onSelectRoute(route.id)}>
                     <span>{route.name}</span>
                     <strong>{route.count}/{route.capacity}</strong>
-                  </div>
-                  {typeof route.distanciaKm === 'number' && (
-                    <p className="route-meta">
-                      ≈{route.distanciaKm} km{route.usedOrs ? '' : ' (linha reta)'}
-                      {typeof route.dispersaoGraus === 'number' ? ` · dispersão ${route.dispersaoGraus}°` : ''}
-                    </p>
-                  )}
-
-                  <label className="capacity-field">Cap.
-                    <input
-                      type="number"
-                      min="1"
-                      value={route.capacity}
-                      onChange={(e) => onUpdateRouteCapacity(route.id, e.target.value)}
-                    />
-                  </label>
-
-                  <div className="route-actions">
-                    <button className="mini" onClick={() => onToggleHiddenRoute(route.id)}>
-                      {hiddenRoutes.has(route.id) ? 'Mostrar' : 'Ocultar'}
-                    </button>
-                    <button className="mini danger" onClick={() => onRemoveRoute(route.id)} disabled={project.routes.length <= 1}>
-                      Remover
-                    </button>
-                  </div>
-
-                  <button
-                    type="button"
-                    className={`route-detail-toggle ${isFocused ? 'active' : ''}`}
-                    onClick={() => onToggleFocusRoute(route.id)}
-                  >
-                    {isFocused ? 'Ocultar trajeto e ordem ▲' : 'Ver trajeto e ordem de embarque ▼'}
                   </button>
 
-                  {isFocused && (
-                    <div className="route-details">
-                      {preview.loading && <span className="status">Calculando trajeto...</span>}
-                      {preview.error && <span className="status error">{preview.error}</span>}
-                      {!preview.loading && !preview.error && (
-                        <span className="status">
-                          {preview.usedRealRoute
-                            ? 'Trajeto calculado pelas ruas (ORS).'
-                            : 'Linha reta entre os pontos (defina ORS_API_KEY no backend para trajeto real).'}
-                        </span>
+                  {/* Detalhes só aparecem ao selecionar a rota (Estado 2 -
+                      Foco): capacidade, ocultar/remover, distância,
+                      dispersão e status do ORS ficam escondidos até então. */}
+                  {isSelected && (
+                    <div className="route-row-details">
+                      {typeof route.distanciaKm === 'number' && (
+                        <p className="route-meta">
+                          ≈{route.distanciaKm} km{route.usedOrs ? '' : ' (linha reta)'}
+                          {typeof route.dispersaoGraus === 'number' ? ` · dispersão ${route.dispersaoGraus}°` : ''}
+                        </p>
                       )}
+
+                      <div className="route-row-controls">
+                        <label className="capacity-field">Cap.
+                          <input
+                            type="number"
+                            min="1"
+                            value={route.capacity}
+                            onChange={(e) => onUpdateRouteCapacity(route.id, e.target.value)}
+                          />
+                        </label>
+                        <div className="route-actions">
+                          <button className="mini" onClick={() => onToggleHiddenRoute(route.id)}>
+                            {hiddenRoutes.has(route.id) ? 'Mostrar' : 'Ocultar'}
+                          </button>
+                          <button className="mini danger" onClick={() => onRemoveRoute(route.id)} disabled={project.routes.length <= 1}>
+                            Remover
+                          </button>
+                        </div>
+                      </div>
+
                       <button
                         type="button"
-                        className="auto-order-btn"
-                        disabled={preview.loading || routeCollaborators.length < 2}
-                        onClick={() => onAutoOrderRoute(route.id)}
+                        className={`route-detail-toggle ${isEditing ? 'active' : ''}`}
+                        onClick={() => onToggleEditing(route.id)}
                       >
-                        Ordenar automaticamente (mais distante → destino)
+                        {isEditing ? 'Fechar edição de ordem ▲' : 'Ver trajeto e editar ordem ▼'}
                       </button>
-                      <p className="muted small">
-                        Arraste um colaborador para reposicionar, ou use as setas para ajustes finos.
-                      </p>
-                      <RouteOrderList
-                        collaborators={routeCollaborators}
-                        onReorder={onReorderRoute}
-                        disabled={preview.loading}
-                      />
+
+                      {/* Ordem de embarque e trajeto real só carregam no
+                          Estado 3 (Edição) — modo ativo de modificação. */}
+                      {isEditing && (
+                        <div className="route-details">
+                          {preview.loading && <span className="status">Calculando trajeto...</span>}
+                          {preview.error && <span className="status error">{preview.error}</span>}
+                          {!preview.loading && !preview.error && (
+                            <span className="status">
+                              {preview.usedRealRoute
+                                ? 'Trajeto calculado pelas ruas (ORS).'
+                                : 'Linha reta entre os pontos (defina ORS_API_KEY no backend para trajeto real).'}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            className="auto-order-btn"
+                            disabled={preview.loading || routeCollaborators.length < 2}
+                            onClick={() => onAutoOrderRoute(route.id)}
+                          >
+                            Ordenar automaticamente (mais distante → destino)
+                          </button>
+                          <p className="muted small">
+                            Arraste um colaborador para reposicionar, ou use as setas para ajustes finos.
+                          </p>
+                          <RouteOrderList
+                            collaborators={routeCollaborators}
+                            onReorder={onReorderRoute}
+                            disabled={preview.loading}
+                          />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
               );
             })}
+
+            {visibleCounts.length === 0 && (
+              <p className="muted route-search-empty">Nenhuma rota encontrada para "{routeSearch}".</p>
+            )}
           </div>
         </section>
       </div>
@@ -174,6 +213,16 @@ export default function RoutesPanel({
           <button className="secondary" onClick={onSaveAssignments}>Salvar edições</button>
           <button className="primary" onClick={onDownloadZip}>Baixar KMLs e relatório</button>
         </div>
+        {project.conhecimentoDisponivel && (
+          <button
+            type="button"
+            className={`knowledge-btn ${project.conhecimentoRegistrado ? 'saved' : ''}`}
+            onClick={onSaveToKnowledgeBase}
+            disabled={savingKnowledge}
+          >
+            {knowledgeLabel}
+          </button>
+        )}
       </div>
     </aside>
   );

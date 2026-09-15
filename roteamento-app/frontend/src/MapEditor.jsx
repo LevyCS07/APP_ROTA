@@ -14,7 +14,8 @@ function routeColor(routeId) {
   return COLORS[(routeId - 1) % COLORS.length];
 }
 
-// order !== null desenha um marcador maior com o número da sequência de embarque.
+// order !== null desenha um marcador maior com o número da sequência de embarque
+// (só usado no Estado 3 - Edição, quando uma rota está de fato sendo editada).
 function pointIcon(routeId, { selected = false, order = null } = {}) {
   const color = routeColor(routeId);
   const hasOrder = order !== null && order !== undefined;
@@ -53,7 +54,16 @@ export default function MapEditor({ project, setProject }) {
   const [selected, setSelected] = useState(new Set());
   const [bulkRoute, setBulkRoute] = useState(project.routes[0]?.id || 1);
   const [hiddenRoutes, setHiddenRoutes] = useState(new Set());
-  const [focusedRouteId, setFocusedRouteId] = useState(null);
+
+  // Os 3 estados de visualização do mapa:
+  //   Estado 1 (Geral)  -> selectedRouteId === null: todas as rotas normais.
+  //   Estado 2 (Foco)   -> selectedRouteId definido, editingRouteId === null:
+  //                        a rota selecionada em destaque, as demais esmaecidas.
+  //   Estado 3 (Edição) -> editingRouteId === selectedRouteId: além do foco,
+  //                        busca o trajeto real e habilita reordenar embarque.
+  const [selectedRouteId, setSelectedRouteId] = useState(null);
+  const [editingRouteId, setEditingRouteId] = useState(null);
+
   const [preview, setPreview] = useState(EMPTY_PREVIEW);
   // Espelha selectingRef em estado só para dar feedback visual no botão
   // "Selecionar área" (o ref sozinho é o que os handlers do mapa usam de fato).
@@ -63,6 +73,9 @@ export default function MapEditor({ project, setProject }) {
   // edições"), para mostrar um aviso perto do botão de salvar.
   const [dirty, setDirty] = useState(false);
   const savedSnapshotRef = useRef(snapshotAssignments(project));
+  // Persistência opcional na base de conhecimento (Supabase) — só acontece
+  // quando o usuário clica no botão, nunca automaticamente.
+  const [savingKnowledge, setSavingKnowledge] = useState(false);
 
   function setSelectMode(value) {
     selectingRef.current = value;
@@ -87,11 +100,13 @@ export default function MapEditor({ project, setProject }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // Mapa de colaboradorId -> posição na sequência de embarque, para a rota em foco.
+  // Mapa de colaboradorId -> posição na sequência de embarque, só relevante
+  // no Estado 3 (Edição) — no Estado 2 (Foco) os pontos só ficam em destaque,
+  // sem numeração de ordem.
   const orderByCollabId = new Map(
-    focusedRouteId
+    editingRouteId
       ? project.collaborators
-          .filter((c) => c.routeId === focusedRouteId)
+          .filter((c) => c.routeId === editingRouteId)
           .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
           .map((c, index) => [c.id, index + 1])
       : []
@@ -125,13 +140,18 @@ export default function MapEditor({ project, setProject }) {
       if (collab.routeId && hiddenRoutes.has(collab.routeId)) return;
       const isSelected = selected.has(collab.id);
       const route = project.routes.find((item) => item.id === collab.routeId);
-      const order = collab.routeId === focusedRouteId ? orderByCollabId.get(collab.id) : null;
+      const order = collab.routeId === editingRouteId ? orderByCollabId.get(collab.id) : null;
       const tooltip = collab.routeId
         ? `${order ? `#${order} · ` : ''}${collab.nome} (${route?.name || `Rota ${collab.routeId}`})`
         : `${collab.nome} (sem rota)`;
       const marker = L.marker([collab.lat, collab.lon], {
         icon: pointIcon(collab.routeId, { selected: isSelected, order })
       }).bindTooltip(tooltip);
+      // Estado 2 (Foco) e Estado 3 (Edição): esmaece tudo que não pertence à
+      // rota selecionada, para ela se destacar visualmente no mapa.
+      if (selectedRouteId) {
+        marker.setOpacity(collab.routeId === selectedRouteId ? 1 : 0.22);
+      }
       marker.on('click', () => {
         setSelected((prev) => {
           const next = new Set(prev);
@@ -163,7 +183,7 @@ export default function MapEditor({ project, setProject }) {
       fittedProjectRef.current = project.id;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, selected, hiddenRoutes, focusedRouteId]);
+  }, [project, selected, hiddenRoutes, selectedRouteId, editingRouteId]);
 
   // Seleção de área por arrasto (retângulo).
   useEffect(() => {
@@ -244,7 +264,7 @@ export default function MapEditor({ project, setProject }) {
     if (coordinates?.length > 1) {
       const latlngs = coordinates.map(([lon, lat]) => [lat, lon]);
       trajetoLayerRef.current = L.polyline(latlngs, {
-        color: routeColor(focusedRouteId),
+        color: routeColor(editingRouteId),
         weight: 4,
         opacity: 0.85
       }).addTo(map);
@@ -253,11 +273,11 @@ export default function MapEditor({ project, setProject }) {
     return null;
   }
 
-  // Busca e desenha o trajeto real da rota em foco. Sincroniza as
-  // atribuições com o backend primeiro, para garantir que o preview reflita
-  // qualquer edição local ainda não salva.
+  // Busca e desenha o trajeto real da rota em edição (Estado 3). Sincroniza
+  // as atribuições com o backend primeiro, para garantir que o preview
+  // reflita qualquer edição local ainda não salva.
   useEffect(() => {
-    if (!focusedRouteId) {
+    if (!editingRouteId) {
       if (trajetoLayerRef.current) {
         mapRef.current.removeLayer(trajetoLayerRef.current);
         trajetoLayerRef.current = null;
@@ -274,7 +294,7 @@ export default function MapEditor({ project, setProject }) {
         const synced = await syncAssignments();
         if (cancelled) return;
         setProject(synced);
-        const data = await api.previewRoute(synced.id, focusedRouteId, synced.tipoRota);
+        const data = await api.previewRoute(synced.id, editingRouteId, synced.tipoRota);
         if (cancelled) return;
         setPreview({
           loading: false,
@@ -295,7 +315,7 @@ export default function MapEditor({ project, setProject }) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedRouteId]);
+  }, [editingRouteId]);
 
   function applySelected() {
     const next = {
@@ -325,18 +345,30 @@ export default function MapEditor({ project, setProject }) {
     });
   }
 
-  function toggleFocusRoute(routeId) {
-    setFocusedRouteId((current) => (current === routeId ? null : routeId));
+  // Estado 2 (Foco): clicar numa rota compacta seleciona/desseleciona.
+  // Trocar de rota selecionada sempre fecha a edição da rota anterior.
+  function selectRoute(routeId) {
+    setSelectedRouteId((current) => {
+      setEditingRouteId(null);
+      return current === routeId ? null : routeId;
+    });
+  }
+
+  // Estado 3 (Edição): liga/desliga o modo ativo de edição (trajeto real +
+  // reordenar embarque) da rota já selecionada.
+  function toggleEditing(routeId) {
+    setSelectedRouteId(routeId);
+    setEditingRouteId((current) => (current === routeId ? null : routeId));
   }
 
   async function reorderFocusedRoute(orderedIds) {
-    if (!focusedRouteId) return;
+    if (!editingRouteId) return;
     setPreview((prev) => ({ ...prev, loading: true }));
     try {
       const synced = await syncAssignments();
-      const updated = await api.reorderRoute(synced.id, focusedRouteId, orderedIds);
+      const updated = await api.reorderRoute(synced.id, editingRouteId, orderedIds);
       setProject(updated);
-      const data = await api.previewRoute(updated.id, focusedRouteId, updated.tipoRota);
+      const data = await api.previewRoute(updated.id, editingRouteId, updated.tipoRota);
       setPreview({
         loading: false,
         error: null,
@@ -351,10 +383,10 @@ export default function MapEditor({ project, setProject }) {
     }
   }
 
-  // Ordena automaticamente a rota em foco: começa no colaborador mais distante
-  // do destino e encadeia pelo vizinho mais próximo até o fim (heurística do
-  // vizinho mais próximo). O cálculo é feito no backend, que já tem as
-  // coordenadas de todos os colaboradores.
+  // Ordena automaticamente a rota em edição: começa no colaborador mais
+  // distante do destino e encadeia pelo vizinho mais próximo até o fim
+  // (heurística do vizinho mais próximo). O cálculo é feito no backend, que
+  // já tem as coordenadas de todos os colaboradores.
   async function autoOrderFocusedRoute(routeId) {
     if (!routeId) return;
     setPreview((prev) => ({ ...prev, loading: true }));
@@ -394,7 +426,8 @@ export default function MapEditor({ project, setProject }) {
       );
       if (!ok) return;
     }
-    if (focusedRouteId === routeId) setFocusedRouteId(null);
+    if (selectedRouteId === routeId) setSelectedRouteId(null);
+    if (editingRouteId === routeId) setEditingRouteId(null);
     const updated = await api.removeRoute(project.id, routeId);
     setProject(updated);
   }
@@ -415,7 +448,26 @@ export default function MapEditor({ project, setProject }) {
     window.location.href = api.downloadUrl(project.id);
   }
 
-  const routeCollaborators = project.collaborators.filter((c) => c.routeId === focusedRouteId);
+  // Persistência opcional (Parte 1): só acontece quando o usuário clica.
+  async function saveToKnowledgeBase() {
+    setSavingKnowledge(true);
+    try {
+      const result = await api.saveToKnowledgeBase(project.id);
+      setProject({ ...project, conhecimentoRegistrado: true });
+      const rotulos = {
+        AUTOMATICA_APROVADA: 'aprovada sem alterações',
+        AUTOMATICA_AJUSTADA: 'gerada automaticamente e ajustada por você',
+        MANUAL_VALIDADA: 'criada manualmente'
+      };
+      alert(`Salvo no histórico como rota ${rotulos[result.tipoOrigem] || result.tipoOrigem}.`);
+    } catch (err) {
+      alert(`Não foi possível salvar no histórico: ${err.message}`);
+    } finally {
+      setSavingKnowledge(false);
+    }
+  }
+
+  const routeCollaborators = project.collaborators.filter((c) => c.routeId === editingRouteId);
 
   return (
     <div className="editor">
@@ -433,13 +485,17 @@ export default function MapEditor({ project, setProject }) {
         onAddRoute={addRoute}
         onSaveAssignments={() => saveAssignments()}
         onDownloadZip={downloadZip}
+        onSaveToKnowledgeBase={saveToKnowledgeBase}
+        savingKnowledge={savingKnowledge}
         dirty={dirty}
         hiddenRoutes={hiddenRoutes}
         onToggleHiddenRoute={toggleHiddenRoute}
         onRemoveRoute={removeRoute}
         onUpdateRouteCapacity={updateRouteCapacity}
-        focusedRouteId={focusedRouteId}
-        onToggleFocusRoute={toggleFocusRoute}
+        selectedRouteId={selectedRouteId}
+        editingRouteId={editingRouteId}
+        onSelectRoute={selectRoute}
+        onToggleEditing={toggleEditing}
         routeCollaborators={routeCollaborators}
         onReorderRoute={reorderFocusedRoute}
         onAutoOrderRoute={autoOrderFocusedRoute}

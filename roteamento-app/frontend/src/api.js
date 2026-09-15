@@ -71,5 +71,11 @@ export const api = {
 
   downloadUrl(projectId) {
     return `${API_URL}/api/projects/${projectId}/download`;
+  },
+
+  // Persistência opcional na base de conhecimento (Supabase). Só é chamado
+  // quando o usuário clica explicitamente no botão — nunca automático.
+  saveToKnowledgeBase(projectId) {
+    return requestJson(`/api/projects/${projectId}/save-to-knowledge-base`, { method: 'POST' });
   }
 };
