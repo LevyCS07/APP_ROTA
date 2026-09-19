@@ -412,3 +412,71 @@ def register_feedback(project, sugestao_original, lat_key, lon_key):
         return tipo_origem
 
     return _safe(_do)
+
+
+# ---------------------------------------------------------------------------
+# Painel do histórico (item 6): visão agregada do que já foi aprendido
+# ---------------------------------------------------------------------------
+
+def get_stats(limit_top_correlacoes=15):
+    """Retorna um resumo para exibição num painel: quantos cenários existem
+    por status, ocupação/tempo médios, e os pares de pontos que mais se
+    repetem como conexão forte ou penalização — só coordenadas, nunca
+    identidade de colaborador."""
+    client = _get_client()
+    if not client:
+        return {"disponivel": False}
+
+    def _do():
+        cenarios = (
+            client.table("cenarios")
+            .select("tipo_origem, capacidade_veiculo, total_colaboradores, total_rotas, distancia_total_km, tempo_total_min, criado_em")
+            .order("criado_em", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        )
+        por_status = Counter(c["tipo_origem"] for c in cenarios)
+
+        ocupacoes = []
+        for c in cenarios:
+            capacidade_total = (c.get("capacidade_veiculo") or 0) * (c.get("total_rotas") or 0)
+            if capacidade_total:
+                ocupacoes.append((c.get("total_colaboradores") or 0) / capacidade_total)
+        ocupacao_media = round(sum(ocupacoes) / len(ocupacoes), 3) if ocupacoes else None
+
+        tempos = [c["tempo_total_min"] for c in cenarios if c.get("tempo_total_min")]
+        tempo_total_medio = round(sum(tempos) / len(tempos), 1) if tempos else None
+
+        def top_pares(tipo):
+            rows = (
+                client.table("correlacoes_pontos")
+                .select("ponto_a_lat, ponto_a_lon, ponto_b_lat, ponto_b_lon, ocorrencias")
+                .eq("tipo", tipo)
+                .order("ocorrencias", desc=True)
+                .limit(limit_top_correlacoes)
+                .execute()
+                .data
+                or []
+            )
+            return [
+                {
+                    "pontoA": [row["ponto_a_lat"], row["ponto_a_lon"]],
+                    "pontoB": [row["ponto_b_lat"], row["ponto_b_lon"]],
+                    "ocorrencias": row["ocorrencias"],
+                }
+                for row in rows
+            ]
+
+        return {
+            "disponivel": True,
+            "totalCenarios": len(cenarios),
+            "porStatus": dict(por_status),
+            "ocupacaoMedia": ocupacao_media,
+            "tempoTotalMedioMin": tempo_total_medio,
+            "topConexoesFortes": top_pares("CONEXAO_FORTE"),
+            "topPenalizacoes": top_pares("PENALIZACAO"),
+        }
+
+    return _safe(_do, default={"disponivel": False})

@@ -3,16 +3,15 @@ import json
 import math
 import os
 import re
-import sqlite3
-import threading
+import secrets
 import uuid
 import zipfile
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from lxml import etree
 from pydantic import BaseModel
 from shapely.geometry import Point, shape
@@ -24,9 +23,11 @@ from shapely.geometry import Point, shape
 try:
     from . import route_optimizer as optimizer
     from . import knowledge_base as kb
+    from . import storage
 except ImportError:
     import route_optimizer as optimizer
     import knowledge_base as kb
+    import storage
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
@@ -34,9 +35,11 @@ TIPOS_ROTA = {"Entrada", "Saída"}
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("APP_DATA_DIR", BASE_DIR / "data"))
-DB_PATH = Path(os.getenv("PROJECTS_DB_PATH", DATA_DIR / "projects.sqlite3"))
 BAIRROS_CACHE = None
-DB_LOCK = threading.RLock()
+
+# Endpoints que continuam acessíveis sem token, mesmo com APP_ACCESS_TOKEN
+# configurado — só o necessário para health checks de infraestrutura (Render).
+PUBLIC_PATHS = {"/api/health"}
 
 allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "https://app-rota.vercel.app").split(",") if origin.strip()]
 app = FastAPI(title="Roteamento API")
@@ -45,31 +48,34 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-App-Token"],
 )
 
 
-def init_db():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Autenticação simples por token compartilhado (item 3). Só entra em
+    vigor se APP_ACCESS_TOKEN estiver configurado — sem essa env var, o
+    comportamento é idêntico ao de antes (sem autenticação), para não
+    quebrar quem já está rodando sem isso configurado."""
+    required_token = os.getenv("APP_ACCESS_TOKEN", "")
+    if not required_token or request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+    provided = request.headers.get("x-app-token", "")
+    if not secrets.compare_digest(provided, required_token):
+        return JSONResponse(status_code=401, content={"detail": "Token de acesso inválido ou ausente."})
+    return await call_next(request)
 
 
 def load_project(project_id: str):
-    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT data FROM projects WHERE id = ?", (project_id,)).fetchone()
-    if not row:
+    data = storage.load_project(project_id)
+    if data is None:
         raise HTTPException(404, "Projeto não encontrado.")
-    return json.loads(row[0])
+    return data
 
 
 def save_project(project):
-    payload = json.dumps(project, ensure_ascii=False, separators=(",", ":"))
-    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO projects(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data",
-            (project["id"], payload),
-        )
+    storage.save_project(project)
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -199,6 +205,7 @@ def project_response(project):
         "modoFrota": project.get("modoFrota", "minimizar"),
         "metaOcupacao": project.get("metaOcupacao", 0.85),
         "limiteMinutos": project.get("limiteMinutos", 90),
+        "pesos": project.get("pesos", {"tempo": 0.40, "coerencia": 0.25, "distancia": 0.20, "ocupacao": 0.15}),
         "routes": project["routes"],
         "collaborators": project["collaborators"],
         # Permite o frontend decidir se mostra o botão "Salvar no histórico"
@@ -216,12 +223,30 @@ def safe_filename(value):
 
 @app.on_event("startup")
 def startup():
-    init_db()
+    storage.init()
 
 
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/auth/check")
+def auth_check():
+    """Usado pelo frontend para validar um token antes de guardá-lo (a
+    verificação de fato acontece no middleware — se a requisição chegou
+    aqui, o token já foi aceito, ou a autenticação está desligada)."""
+    return {"ok": True, "authRequired": bool(os.getenv("APP_ACCESS_TOKEN"))}
+
+
+@app.get("/api/knowledge/stats")
+def knowledge_stats():
+    """Painel do histórico (item 6): visão agregada do que já foi salvo na
+    base de conhecimento — quantos cenários por status, e os pares de
+    pontos que mais se repetem como conexão forte ou penalização."""
+    if not kb.is_enabled():
+        raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
+    return kb.get_stats()
 
 
 @app.post("/api/projects")
@@ -237,6 +262,10 @@ async def create_project(
     modo_frota: str = Form("minimizar"),
     meta_ocupacao: float = Form(0.85),
     limite_minutos: float = Form(90),
+    peso_tempo: float = Form(0.40),
+    peso_coerencia: float = Form(0.25),
+    peso_distancia: float = Form(0.20),
+    peso_ocupacao: float = Form(0.15),
 ):
     if tipo_rota not in TIPOS_ROTA:
         raise HTTPException(422, "tipo_rota deve ser 'Entrada' ou 'Saída'.")
@@ -250,6 +279,11 @@ async def create_project(
         raise HTTPException(422, "meta_ocupacao deve estar entre 0 e 1.")
     if limite_minutos < 1:
         raise HTTPException(422, "limite_minutos deve ser maior que zero.")
+    pesos = {"tempo": peso_tempo, "coerencia": peso_coerencia, "distancia": peso_distancia, "ocupacao": peso_ocupacao}
+    if any(peso < 0 for peso in pesos.values()):
+        raise HTTPException(422, "Os pesos do algoritmo não podem ser negativos.")
+    if sum(pesos.values()) <= 0:
+        raise HTTPException(422, "A soma dos pesos do algoritmo deve ser maior que zero.")
     if not valid_coordinate(destino_lat, destino_lon):
         raise HTTPException(422, "Coordenadas de destino inválidas.")
     if capacidade < 1:
@@ -271,6 +305,10 @@ async def create_project(
             modo_frota=modo_frota,
             meta_ocupacao=meta_ocupacao,
             tempo_limite_min=limite_minutos,
+            peso_tempo=peso_tempo,
+            peso_coerencia=peso_coerencia,
+            peso_distancia=peso_distancia,
+            peso_ocupacao=peso_ocupacao,
         )
         lat_key = "latE" if tipo_rota == "Entrada" else "latS"
         lon_key = "lonE" if tipo_rota == "Entrada" else "lonS"
@@ -297,6 +335,7 @@ async def create_project(
         "modoFrota": modo_frota,
         "metaOcupacao": meta_ocupacao,
         "limiteMinutos": limite_minutos,
+        "pesos": pesos,
         "routes": routes,
         "collaborators": collaborators,
         # Uso interno (feedback loop) — nunca exposto pelo project_response.
