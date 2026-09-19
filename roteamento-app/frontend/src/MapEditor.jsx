@@ -77,6 +77,62 @@ export default function MapEditor({ project, setProject }) {
   // quando o usuário clica no botão, nunca automaticamente.
   const [savingKnowledge, setSavingKnowledge] = useState(false);
 
+  // Desfazer/Refazer: guarda snapshots da lista de colaboradores (routeId +
+  // order de cada um) antes de ações que valem a pena poder desfazer —
+  // atribuir em massa e reordenar. Ações administrativas (nova rota, remover
+  // rota, mudar capacidade) já têm seus próprios diálogos de confirmação e
+  // ficam fora do histórico, para não confundir o que "desfazer" reverte.
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  function pushHistory(collaboratorsSnapshot) {
+    undoStackRef.current.push(collaboratorsSnapshot);
+    if (undoStackRef.current.length > 25) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    setCanUndo(true);
+    setCanRedo(false);
+  }
+
+  function undo() {
+    if (!undoStackRef.current.length) return;
+    const previous = undoStackRef.current.pop();
+    redoStackRef.current.push(project.collaborators);
+    setProject((current) => ({ ...current, collaborators: previous }));
+    setDirty(true);
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+  }
+
+  function redo() {
+    if (!redoStackRef.current.length) return;
+    const next = redoStackRef.current.pop();
+    undoStackRef.current.push(project.collaborators);
+    setProject((current) => ({ ...current, collaborators: next }));
+    setDirty(true);
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+  }
+
+  // Atalhos de teclado: Ctrl/Cmd+Z desfaz, Ctrl/Cmd+Shift+Z (ou Ctrl+Y) refaz.
+  useEffect(() => {
+    function onKeyDown(e) {
+      const ctrlOrCmd = e.ctrlKey || e.metaKey;
+      if (!ctrlOrCmd) return;
+      if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  });
+
   function setSelectMode(value) {
     selectingRef.current = value;
     setSelecting(value);
@@ -318,6 +374,7 @@ export default function MapEditor({ project, setProject }) {
   }, [editingRouteId]);
 
   function applySelected() {
+    pushHistory(project.collaborators);
     const next = {
       ...project,
       collaborators: project.collaborators.map((c) =>
@@ -363,6 +420,7 @@ export default function MapEditor({ project, setProject }) {
 
   async function reorderFocusedRoute(orderedIds) {
     if (!editingRouteId) return;
+    pushHistory(project.collaborators);
     setPreview((prev) => ({ ...prev, loading: true }));
     try {
       const synced = await syncAssignments();
@@ -389,6 +447,7 @@ export default function MapEditor({ project, setProject }) {
   // já tem as coordenadas de todos os colaboradores.
   async function autoOrderFocusedRoute(routeId) {
     if (!routeId) return;
+    pushHistory(project.collaborators);
     setPreview((prev) => ({ ...prev, loading: true }));
     try {
       const synced = await syncAssignments();
@@ -445,7 +504,11 @@ export default function MapEditor({ project, setProject }) {
 
   async function downloadZip() {
     await syncAssignments();
-    window.location.href = api.downloadUrl(project.id);
+    try {
+      await api.downloadZip(project.id);
+    } catch (err) {
+      alert(`Não foi possível baixar o arquivo: ${err.message}`);
+    }
   }
 
   // Persistência opcional (Parte 1): só acontece quando o usuário clica.
@@ -488,6 +551,10 @@ export default function MapEditor({ project, setProject }) {
         onSaveToKnowledgeBase={saveToKnowledgeBase}
         savingKnowledge={savingKnowledge}
         dirty={dirty}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={undo}
+        onRedo={redo}
         hiddenRoutes={hiddenRoutes}
         onToggleHiddenRoute={toggleHiddenRoute}
         onRemoveRoute={removeRoute}

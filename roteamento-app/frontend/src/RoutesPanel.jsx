@@ -17,6 +17,10 @@ export default function RoutesPanel({
   onSaveToKnowledgeBase,
   savingKnowledge,
   dirty,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
   hiddenRoutes,
   onToggleHiddenRoute,
   onRemoveRoute,
@@ -209,6 +213,14 @@ export default function RoutesPanel({
 
       <div className="panel-footer">
         {dirty && <p className="unsaved-note">Alterações não salvas</p>}
+        <div className="footer-buttons undo-redo-row">
+          <button type="button" className="mini" onClick={onUndo} disabled={!canUndo} title="Desfazer (Ctrl+Z)">
+            ↶ Desfazer
+          </button>
+          <button type="button" className="mini" onClick={onRedo} disabled={!canRedo} title="Refazer (Ctrl+Shift+Z)">
+            ↷ Refazer
+          </button>
+        </div>
         <div className="footer-buttons">
           <button className="secondary" onClick={onSaveAssignments}>Salvar edições</button>
           <button className="primary" onClick={onDownloadZip}>Baixar KMLs e relatório</button>
