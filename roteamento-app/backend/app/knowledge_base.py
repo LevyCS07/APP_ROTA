@@ -66,6 +66,9 @@ def _get_client():
     if not url or not key:
         logger.info("Supabase não configurado (SUPABASE_URL/SUPABASE_KEY ausentes) — base de conhecimento desativada.")
         return None
+    # Remove barra(s) no final: evita "Invalid path specified in request URL"
+    # (PGRST125) quando a env var vem com uma barra sobrando por engano.
+    url = url.rstrip("/")
     try:
         from supabase import create_client
         _client = create_client(url, key)

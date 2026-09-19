@@ -40,6 +40,11 @@ def _get_client():
     key = os.getenv("SUPABASE_KEY")
     if not url or not key:
         return None
+    # Remove barra(s) no final: o cliente monta o caminho como
+    # "{url}/rest/v1/tabela" — se a URL já vier com barra sobrando, o
+    # resultado ("..//rest/v1/...") é rejeitado pelo PostgREST com
+    # "Invalid path specified in request URL" (PGRST125).
+    url = url.rstrip("/")
     try:
         from supabase import create_client
         _client = create_client(url, key)
