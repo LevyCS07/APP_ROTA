@@ -179,7 +179,7 @@ def ors_route(coords):
         result = _fallback_route(coords)
     else:
         try:
-            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=15)
+            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=15, retry_timeout=20)
             # optimize_waypoints deliberadamente OMITIDO: a ordem já foi
             # decidida pelo algoritmo (cones + Savings/NN + 2-opt) e deve
             # ser respeitada, não reotimizada pelo ORS.
@@ -229,7 +229,7 @@ def ors_matrix(locations):
         result = _fallback_matrix(locations)
     else:
         try:
-            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=20)
+            client = openrouteservice.Client(key=api_key, base_url=ORS_BASE_URL, timeout=20, retry_timeout=20)
             response = client.distance_matrix(locations=locations, profile="driving-car", metrics=["duration", "distance"])
             durations_min = [[(v or 0) / 60 for v in row] for row in response["durations"]]
             distances_km = [[(v or 0) / 1000 for v in row] for row in response["distances"]]
@@ -727,10 +727,17 @@ def _build_strategy_savings(groups, destino, capacity, lat_key, lon_key, config,
     return routes
 
 
-def _finalize_strategy(route_member_lists, destino, capacity, lat_key, lon_key, config):
+def _finalize_strategy(route_member_lists, destino, capacity, lat_key, lon_key, config, use_real_routing=True):
     """Atribui ids definitivos às rotas, garante o limite de 90 minutos
     (dividindo recursivamente quem ultrapassar — regra 2/3) e calcula as
-    métricas finais (via ORS, com cache) de cada rota."""
+    métricas de cada rota.
+
+    `use_real_routing`: quando False, usa só a estimativa (Matrix API ou
+    linha reta, via CostContext) para as métricas finais, sem chamar
+    `ors_route()` (a chamada de directions() mais cara). Serve para comparar
+    as 3 estratégias concorrentes sem multiplicar por 3 o número de
+    chamadas reais ao ORS — só a estratégia vencedora é refeita com
+    `use_real_routing=True` para pegar a geometria/tempo/distância reais."""
     pending = []
     next_id = 1
     for members in route_member_lists:
@@ -745,7 +752,7 @@ def _finalize_strategy(route_member_lists, destino, capacity, lat_key, lon_key, 
         if not members:
             continue
         ctx = CostContext(members, destino, lat_key, lon_key)
-        duracao_estim, _distancia_estim = ctx.sequence_metrics(members)
+        duracao_estim, distancia_estim = ctx.sequence_metrics(members)
 
         if duracao_estim > config.tempo_limite_min and len(members) > 1 and depth < 5:
             mid = max(1, len(members) // 2)
@@ -755,11 +762,17 @@ def _finalize_strategy(route_member_lists, destino, capacity, lat_key, lon_key, 
             pending.append((new_id, members[mid:], depth + 1))
             continue
 
-        coords = [[m[lon_key], m[lat_key]] for m in members] + [[destino["lon"], destino["lat"]]]
-        _coords, distancia_km, duracao_min, used_ors = ors_route(coords)
+        if use_real_routing:
+            coords = [[m[lon_key], m[lat_key]] for m in members] + [[destino["lon"], destino["lat"]]]
+            _coords, distancia_km, duracao_min, used_ors = ors_route(coords)
+            if not used_ors:
+                distancia_km, duracao_min = distancia_estim, duracao_estim
+        else:
+            distancia_km, duracao_min, used_ors = distancia_estim, duracao_estim, False
+
         metrics = {
-            "duracao_min": duracao_min if used_ors else duracao_estim,
-            "distancia_km": distancia_km if used_ors else _distancia_estim,
+            "duracao_min": duracao_min,
+            "distancia_km": distancia_km,
             "ocupacao": len(members) / capacity,
             "dispersao_graus": _angular_spread([m["bearing"] for m in members]),
             "zigzag_score": _zigzag_score(members, lat_key, lon_key),
@@ -838,12 +851,30 @@ def generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rot
     groups_savings_refino = _apply_relocate(groups_savings_refino, destino, capacity, lat_key, lon_key, config, hints)
     candidatos["cones_savings_2opt_refino"] = _build_strategy_savings(groups_savings_refino, destino, capacity, lat_key, lon_key, config, hints)
 
-    melhor_nome, melhor_routes, melhor_membros, melhor_custo = None, None, None, math.inf
+    # Primeiro round: compara as 3 estratégias usando só estimativas
+    # (Matrix API já cacheada durante a construção, ou linha reta) — sem
+    # chamar directions() para as 2 estratégias perdedoras, o que evitava
+    # triplicar o número de chamadas reais ao ORS numa única geração e
+    # esbarrar na cota/limite de requisições por minuto.
+    melhor_nome, melhor_route_lists, melhor_custo = None, None, math.inf
     for nome, route_lists in candidatos.items():
-        routes, membros = _finalize_strategy(route_lists, destino, capacity, lat_key, lon_key, config)
-        custo = avaliar_solucao(routes, config)
+        # Usa cópias para essa rodada de comparação não "gastar" a divisão
+        # por limite de tempo que a rodada final (com dados reais) fará de novo.
+        route_lists_copia = [[dict(m) for m in grupo] for grupo in route_lists]
+        routes_estim, _membros_estim = _finalize_strategy(
+            route_lists_copia, destino, capacity, lat_key, lon_key, config, use_real_routing=False
+        )
+        custo = avaliar_solucao(routes_estim, config)
         if custo < melhor_custo:
-            melhor_nome, melhor_routes, melhor_membros, melhor_custo = nome, routes, membros, custo
+            melhor_nome, melhor_route_lists, melhor_custo = nome, route_lists, custo
+
+    # Segunda rodada: só a estratégia vencedora é refeita com roteamento
+    # real do ORS (distância/tempo/geometria autoritativos para o KML e o
+    # mapa) — é a única chamada "cara" de fato, feita uma vez só.
+    melhor_routes, melhor_membros = _finalize_strategy(
+        melhor_route_lists, destino, capacity, lat_key, lon_key, config, use_real_routing=True
+    )
+    melhor_custo = avaliar_solucao(melhor_routes, config)
 
     # Copia o resultado da estratégia vencedora de volta para os objetos
     # originais (o chamador espera que `collaborators` seja mutado in-place).
