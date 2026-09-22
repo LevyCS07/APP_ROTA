@@ -156,6 +156,36 @@ input[type="range"] { padding: 0; accent-color: #047857; }
 .order-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .order-actions { display: flex; gap: 3px; }
 .order-actions button { padding: 3px 7px; font-size: 11px; }
+
+/* Painel de bairros e zonas */
+.regions-section { padding-top: 10px; padding-bottom: 10px; }
+.link-btn-dark { background: transparent; color: #93c5fd; font-weight: 700; font-size: 12px; padding: 4px 0; text-align: left; width: 100%; }
+.link-btn-dark:hover { background: transparent; text-decoration: underline; }
+.regions-panel { margin-top: 8px; display: grid; gap: 10px; }
+.regions-subtitle { margin: 0; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: #94a3b8; font-weight: 800; }
+.region-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 220px; overflow: auto; }
+.region-list li { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; background: #1f2937; border-radius: 6px; padding: 6px 8px; font-size: 11.5px; color: #d1d5db; }
+.region-list.toggleable li { grid-template-columns: 1fr auto auto; }
+.region-list li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.region-list li strong { color: #93c5fd; font-size: 11px; }
+.region-list li.hidden { opacity: .5; }
+.region-list li.hidden strong { color: #6b7280; }
+
+/* Overlay de carregamento (gerar/abrir editor) */
+.loading-overlay {
+  position: fixed; inset: 0; z-index: 999; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px;
+  background: rgba(15, 23, 42, 0.88); color: #fff; text-align: center; padding: 24px;
+}
+.spinner {
+  width: 46px; height: 46px; border-radius: 50%;
+  border: 4px solid rgba(255, 255, 255, 0.2); border-top-color: #34d399;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-title { font-size: 16px; font-weight: 800; margin: 0; }
+.loading-hint { font-size: 13px; color: #cbd5e1; margin: 0; max-width: 360px; }
+
 @media (max-width: 900px) {
   .editor { grid-template-columns: 1fr; grid-template-rows: 1fr 330px; }
   .panel { border-left: 0; border-top: 1px solid #374151; }

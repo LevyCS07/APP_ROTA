@@ -54,6 +54,8 @@ export default function MapEditor({ project, setProject }) {
   const [selected, setSelected] = useState(new Set());
   const [bulkRoute, setBulkRoute] = useState(project.routes[0]?.id || 1);
   const [hiddenRoutes, setHiddenRoutes] = useState(new Set());
+  // Ocultar/mostrar colaboradores por bairro (painel de bairros e zonas).
+  const [hiddenBairros, setHiddenBairros] = useState(new Set());
 
   // Os 3 estados de visualização do mapa:
   //   Estado 1 (Geral)  -> selectedRouteId === null: todas as rotas normais.
@@ -194,6 +196,7 @@ export default function MapEditor({ project, setProject }) {
 
     project.collaborators.forEach((collab) => {
       if (collab.routeId && hiddenRoutes.has(collab.routeId)) return;
+      if (collab.bairro && hiddenBairros.has(collab.bairro)) return;
       const isSelected = selected.has(collab.id);
       const route = project.routes.find((item) => item.id === collab.routeId);
       const order = collab.routeId === editingRouteId ? orderByCollabId.get(collab.id) : null;
@@ -239,7 +242,7 @@ export default function MapEditor({ project, setProject }) {
       fittedProjectRef.current = project.id;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, selected, hiddenRoutes, selectedRouteId, editingRouteId]);
+  }, [project, selected, hiddenRoutes, hiddenBairros, selectedRouteId, editingRouteId]);
 
   // Seleção de área por arrasto (retângulo).
   useEffect(() => {
@@ -266,6 +269,7 @@ export default function MapEditor({ project, setProject }) {
       const bounds = L.latLngBounds(selectStartRef.current, e.latlng);
       const ids = project.collaborators
         .filter((c) => !c.routeId || !hiddenRoutes.has(c.routeId))
+        .filter((c) => !c.bairro || !hiddenBairros.has(c.bairro))
         .filter((c) => bounds.contains(L.latLng(c.lat, c.lon)))
         .map((c) => c.id);
       setSelected((prev) => new Set([...prev, ...ids]));
@@ -287,7 +291,7 @@ export default function MapEditor({ project, setProject }) {
       map.off('mousemove', onMouseMove);
       map.off('mouseup', onMouseUp);
     };
-  }, [project, hiddenRoutes]);
+  }, [project, hiddenRoutes, hiddenBairros]);
 
   // Envia ao backend o estado atual de atribuição de rotas (routeId de cada
   // colaborador). Ações como "Atribuir" só mudam o estado local no
@@ -395,6 +399,23 @@ export default function MapEditor({ project, setProject }) {
         const cleaned = new Set(current);
         project.collaborators.forEach((collab) => {
           if (collab.routeId === routeId) cleaned.delete(collab.id);
+        });
+        return cleaned;
+      });
+      return next;
+    });
+  }
+
+  // Painel de bairros e zonas: ocultar/mostrar colaboradores por bairro.
+  function toggleHiddenBairro(bairro) {
+    setHiddenBairros((prev) => {
+      const next = new Set(prev);
+      if (next.has(bairro)) next.delete(bairro);
+      else next.add(bairro);
+      setSelected((current) => {
+        const cleaned = new Set(current);
+        project.collaborators.forEach((collab) => {
+          if (collab.bairro === bairro) cleaned.delete(collab.id);
         });
         return cleaned;
       });
@@ -556,6 +577,8 @@ export default function MapEditor({ project, setProject }) {
         onUndo={undo}
         onRedo={redo}
         hiddenRoutes={hiddenRoutes}
+        hiddenBairros={hiddenBairros}
+        onToggleHiddenBairro={toggleHiddenBairro}
         onToggleHiddenRoute={toggleHiddenRoute}
         onRemoveRoute={removeRoute}
         onUpdateRouteCapacity={updateRouteCapacity}

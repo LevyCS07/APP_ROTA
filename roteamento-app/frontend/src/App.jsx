@@ -5,6 +5,17 @@ import MapEditor from './MapEditor.jsx';
 import Login from './Login.jsx';
 import Dashboard from './Dashboard.jsx';
 
+// Mensagens rotativas exibidas enquanto o modo automático processa — ele
+// pode levar alguns segundos (chamadas reais ao ORS), então dar contexto
+// do que está acontecendo evita a sensação de "travou".
+const AUTO_LOADING_HINTS = [
+  'Agrupando colaboradores por direção e zona...',
+  'Calculando distâncias e tempos reais pelas ruas...',
+  'Testando estratégias diferentes de rotas...',
+  'Ajustando ocupação e sequência de embarque...',
+  'Quase lá — finalizando os detalhes...'
+];
+
 export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
@@ -39,6 +50,18 @@ export default function App() {
 
   const [project, setProject] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [hintIndex, setHintIndex] = useState(0);
+
+  // Alterna a dica exibida na animação de carregamento enquanto o modo
+  // automático está processando.
+  useEffect(() => {
+    if (!loading || modo !== 'automatico') return;
+    setHintIndex(0);
+    const interval = setInterval(() => {
+      setHintIndex((i) => (i + 1) % AUTO_LOADING_HINTS.length);
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [loading, modo]);
 
   // Autenticação: valida o token guardado (se houver) uma vez, ao carregar
   // o app. Se o backend não exigir token (APP_ACCESS_TOKEN não configurado),
@@ -102,7 +125,17 @@ export default function App() {
   if (view === 'dashboard') return <Dashboard onBack={() => setView('setup')} />;
 
   return (
-    <main className="setup">
+    <>
+      {loading && (
+        <div className="loading-overlay" role="status" aria-live="polite">
+          <div className="spinner" />
+          <p className="loading-title">
+            {modo === 'automatico' ? 'Gerando rotas automaticamente...' : 'Preparando o editor...'}
+          </p>
+          {modo === 'automatico' && <p className="loading-hint">{AUTO_LOADING_HINTS[hintIndex]}</p>}
+        </div>
+      )}
+      <main className="setup">
       <section className="setup-card">
         <h1>Roteamento</h1>
         <p className="setup-subtitle">Monte rotas por seleção visual no mapa e gere KMLs por ruas com ORS.</p>
@@ -251,6 +284,7 @@ export default function App() {
           </button>
         </div>
       </section>
-    </main>
+      </main>
+    </>
   );
 }

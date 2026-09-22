@@ -23,6 +23,8 @@ export default function RoutesPanel({
   onRedo,
   hiddenRoutes,
   onToggleHiddenRoute,
+  hiddenBairros,
+  onToggleHiddenBairro,
   onRemoveRoute,
   onUpdateRouteCapacity,
   selectedRouteId,
@@ -37,6 +39,8 @@ export default function RoutesPanel({
   // Seletor de rotas pesquisável — essencial quando há muitas rotas geradas
   // automaticamente e o usuário quer achar uma específica rápido.
   const [routeSearch, setRouteSearch] = useState('');
+  // Painel de bairros e zonas: fechado por padrão para não ocupar espaço à toa.
+  const [showRegions, setShowRegions] = useState(false);
 
   const allCounts = project.routes.map((route) => ({
     ...route,
@@ -45,6 +49,17 @@ export default function RoutesPanel({
   const query = routeSearch.trim().toLowerCase();
   const visibleCounts = query ? allCounts.filter((route) => route.name.toLowerCase().includes(query)) : allCounts;
   const semRota = project.collaborators.filter((c) => !c.routeId).length;
+
+  // Só entram na lista bairros/zonas que realmente têm colaborador — nada
+  // de listar todo bairro do GeoJSON à toa (pedido explícito).
+  const bairroCounts = {};
+  const zonaCounts = {};
+  project.collaborators.forEach((c) => {
+    if (c.bairro) bairroCounts[c.bairro] = (bairroCounts[c.bairro] || 0) + 1;
+    if (c.zona) zonaCounts[c.zona] = (zonaCounts[c.zona] || 0) + 1;
+  });
+  const bairroEntries = Object.entries(bairroCounts).sort((a, b) => b[1] - a[1]);
+  const zonaEntries = Object.entries(zonaCounts).sort((a, b) => b[1] - a[1]);
 
   const knowledgeLabel = savingKnowledge
     ? 'Salvando no histórico...'
@@ -91,6 +106,53 @@ export default function RoutesPanel({
             </button>
           </div>
         </section>
+
+        {/* Painel de bairros e zonas: quantidade de colaboradores por região,
+            e a possibilidade de ocultar/mostrar por bairro no mapa. */}
+        {(bairroEntries.length > 0 || zonaEntries.length > 0) && (
+          <section className="panel-section regions-section">
+            <button type="button" className="link-btn-dark" onClick={() => setShowRegions((v) => !v)}>
+              {showRegions
+                ? 'Bairros e zonas ▲'
+                : `Bairros e zonas (${bairroEntries.length} bairros, ${zonaEntries.length} zonas) ▼`}
+            </button>
+
+            {showRegions && (
+              <div className="regions-panel">
+                {zonaEntries.length > 0 && (
+                  <>
+                    <p className="regions-subtitle">Zonas</p>
+                    <ul className="region-list">
+                      {zonaEntries.map(([zona, count]) => (
+                        <li key={zona}>
+                          <span>{zona}</span>
+                          <strong>{count}</strong>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+
+                {bairroEntries.length > 0 && (
+                  <>
+                    <p className="regions-subtitle">Bairros</p>
+                    <ul className="region-list toggleable">
+                      {bairroEntries.map(([bairro, count]) => (
+                        <li key={bairro} className={hiddenBairros.has(bairro) ? 'hidden' : ''}>
+                          <span title={bairro}>{bairro}</span>
+                          <strong>{count}</strong>
+                          <button type="button" className="mini" onClick={() => onToggleHiddenBairro(bairro)}>
+                            {hiddenBairros.has(bairro) ? 'Mostrar' : 'Ocultar'}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            )}
+          </section>
+        )}
 
         <section className="panel-section routes-section">
           <div className="routes-header">
