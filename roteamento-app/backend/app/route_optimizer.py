@@ -444,13 +444,33 @@ def _split_by_direction(collaborators, route_count):
     """Ordena os colaboradores pela direção (bearing) a partir do destino,
     corrigindo o corte para não partir um grupo natural ao meio na fronteira
     0°/360° (regra 1), e fatia em `route_count` setores contíguos de tamanho
-    aproximadamente igual."""
+    aproximadamente igual.
+
+    Quando os colaboradores têm uma zona operacional atribuída (GeoJSON de
+    zonas, opcional), ela entra como critério de ordenação PRIMÁRIO — usando
+    a direção média da própria zona — para colaboradores da mesma zona
+    tenderem a cair em fatias angulares contíguas em vez de espalhados por
+    setores distantes. Colaboradores sem zona (ou quando a zona não está
+    configurada) usam só a direção individual, como antes."""
     offset = _circular_cut_offset([c["bearing"] for c in collaborators])
 
     def rotated(b):
         return (b - offset) % 360
 
-    ordered = sorted(collaborators, key=lambda c: rotated(c["bearing"]))
+    zona_bearing_medio = {}
+    for c in collaborators:
+        zona = c.get("zona")
+        if zona:
+            zona_bearing_medio.setdefault(zona, []).append(rotated(c["bearing"]))
+    zona_bearing_medio = {zona: _circular_mean_bearing(bs) for zona, bs in zona_bearing_medio.items()}
+
+    def sort_key(c):
+        zona = c.get("zona")
+        direcao_individual = rotated(c["bearing"])
+        direcao_zona = zona_bearing_medio.get(zona, direcao_individual) if zona else direcao_individual
+        return (direcao_zona, direcao_individual)
+
+    ordered = sorted(collaborators, key=sort_key)
     total = len(ordered)
     groups = [[] for _ in range(route_count)]
     base_size = total / route_count

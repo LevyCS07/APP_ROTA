@@ -31,11 +31,14 @@ except ImportError:
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
+CAMPO_NOME_ZONA = "ZONAS"
 TIPOS_ROTA = {"Entrada", "Saída"}
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("APP_DATA_DIR", BASE_DIR / "data"))
 BAIRROS_CACHE = None
+ZONAS_CACHE = None
+ZONAS_CACHE_CHECKED = False
 
 # Endpoints que continuam acessíveis sem token, mesmo com APP_ACCESS_TOKEN
 # configurado — só o necessário para health checks de infraestrutura (Render).
@@ -134,6 +137,63 @@ def atribuir_bairro(lat, lon, bairros):
     return nearest["idx"], nearest["nome"]
 
 
+def zonas_geojson_path():
+    candidates = [os.getenv("ZONAS_GEOJSON_PATH"), DATA_DIR / "ZONAS_MANAUS.geojson", Path.cwd() / "ZONAS_MANAUS.geojson"]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate)
+    return None
+
+
+def carregar_zonas():
+    """Carrega o GeoJSON de zonas operacionais. Diferente de bairros, zonas
+    são OPCIONAIS: se o arquivo não existir ou vier inválido, devolve uma
+    lista vazia em vez de derrubar a aplicação — o app continua funcionando
+    normalmente, só sem a informação de zona."""
+    global ZONAS_CACHE, ZONAS_CACHE_CHECKED
+    if ZONAS_CACHE_CHECKED:
+        return ZONAS_CACHE
+    ZONAS_CACHE_CHECKED = True
+
+    path = zonas_geojson_path()
+    if not path:
+        ZONAS_CACHE = []
+        return ZONAS_CACHE
+    try:
+        with path.open("r", encoding="utf-8-sig") as file:
+            geojson = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        ZONAS_CACHE = []
+        return ZONAS_CACHE
+
+    zonas = []
+    for feature in geojson.get("features", []):
+        if not feature.get("geometry"):
+            continue
+        geometry = shape(feature["geometry"])
+        if geometry.is_empty:
+            continue
+        properties = feature.get("properties", {})
+        nome = properties.get(CAMPO_NOME_ZONA) or properties.get("ZONA") or properties.get("Zona")
+        if not nome:
+            continue
+        centroid = geometry.centroid
+        zonas.append({"nome": str(nome).strip(), "geometry": geometry, "centroid_lat": centroid.y, "centroid_lon": centroid.x})
+    ZONAS_CACHE = zonas
+    return zonas
+
+
+def atribuir_zona(lat, lon, zonas):
+    if not zonas:
+        return None
+    point = Point(lon, lat)
+    for zona in zonas:
+        if zona["geometry"].covers(point):
+            return zona["nome"]
+    nearest = min(zonas, key=lambda zona: haversine(lat, lon, zona["centroid_lat"], zona["centroid_lon"]))
+    return nearest["nome"]
+
+
 def colunas_tipo(tipo):
     return ("LAT E", "LONG E") if tipo == "Entrada" else ("LAT S", "LONG S")
 
@@ -158,16 +218,26 @@ def read_excel(file_bytes):
 
 def build_collaborators(df, tipo_rota, destino):
     bairros = carregar_bairros()
+    zonas = carregar_zonas()
+    tem_coluna_zona = "ZONA" in df.columns
     lat_col, lon_col = colunas_tipo(tipo_rota)
     collaborators = []
     for idx, row in df.iterrows():
         lat, lon = float(row[lat_col]), float(row[lon_col])
         bairro_idx, bairro_nome = atribuir_bairro(lat, lon, bairros)
+
+        # Zona: a planilha pode informar manualmente na coluna "ZONA", o que
+        # tem prioridade sobre a detecção automática pelo GeoJSON — útil
+        # quando o time operacional já usa sua própria divisão de zonas.
+        zona_manual = str(row["ZONA"]).strip() if tem_coluna_zona and pd.notna(row["ZONA"]) and str(row["ZONA"]).strip() else ""
+        zona_nome = zona_manual or atribuir_zona(lat, lon, zonas)
+
         collaborators.append({
             "id": int(idx),
             "nome": str(row["COLABORADOR"]),
             "bairro_idx": bairro_idx,
             "bairro": bairro_nome,
+            "zona": zona_nome,
             "latE": float(row["LAT E"]),
             "lonE": float(row["LONG E"]),
             "latS": float(row["LAT S"]),
@@ -558,7 +628,7 @@ def download(project_id: str):
             route_filename = safe_filename(route["name"])
             for tipo in TIPOS_ROTA:
                 zipped.writestr(f"{route_filename}_{safe_filename(tipo).lower()}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
-            report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for index, row in enumerate(rows))
+            report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "ZONA": row.get("zona"), "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for index, row in enumerate(rows))
         spreadsheet = io.BytesIO()
         pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
         zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
