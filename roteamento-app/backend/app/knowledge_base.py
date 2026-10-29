@@ -23,8 +23,10 @@ Supabase estiver fora do ar ou nunca tiver sido configurado.
 """
 
 import logging
+import math
 import os
 from collections import Counter
+from datetime import datetime, timezone
 
 logger = logging.getLogger("knowledge_base")
 
@@ -166,6 +168,10 @@ def save_scenario(project, tipo_origem, peso=1.0):
             "tipo_rota": project["tipoRota"],
             "tipo_origem": tipo_origem,
             "peso": peso,
+            # Atualiza a cada (re)salvamento — a busca de cenários
+            # semelhantes ordena por recência, e o default do banco só vale
+            # na criação da linha, não nos upserts seguintes.
+            "atualizado_em": datetime.now(timezone.utc).isoformat(),
         }
         cenario_resp = client.table("cenarios").upsert(cenario_row, on_conflict="app_project_id").execute()
         cenario_id = cenario_resp.data[0]["id"]
@@ -339,14 +345,128 @@ def _upsert_correlacao(client, ponto_a, ponto_b, tipo):
         }).execute()
 
 
+def _haversine_km(lat1, lon1, lat2, lon2):
+    radius_km = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius_km * math.asin(math.sqrt(a))
+
+
+def _consecutive_pairs_in_route(collaborators, lat_key, lon_key):
+    """Pares de colaboradores que ficaram ADJACENTES na sequência de
+    embarque de uma rota validada — um sinal de conexão bem mais preciso do
+    que 'qualquer par que compartilha a rota', que marcaria como 'conexão
+    forte' até pontos nas duas pontas opostas de uma rota grande, que na
+    prática nunca ficam próximos um do outro."""
+    grupos = {}
+    for c in collaborators:
+        if c["routeId"] is None:
+            continue
+        grupos.setdefault(c["routeId"], []).append(c)
+    pares = set()
+    for membros in grupos.values():
+        ordenados = sorted(membros, key=lambda c: c["order"] if c["order"] is not None else 0)
+        for a, b in zip(ordenados, ordenados[1:]):
+            pa = _round_point(a[lat_key], a[lon_key])
+            pb = _round_point(b[lat_key], b[lon_key])
+            if pa != pb:
+                pares.add(frozenset({pa, pb}))
+    return pares
+
+
+def _nearby_pairs_different_routes(collaborators, lat_key, lon_key, proximidade_km):
+    """Pares GEOGRAFICAMENTE PRÓXIMOS que ficaram em rotas diferentes —
+    sinal direto de penalização (o operador optou por separá-los apesar da
+    proximidade). Usa uma grade espacial simples (bucket por célula de
+    ~`proximidade_km`) em vez de comparar todos os pares — O(n) em vez de
+    O(n²), essencial para planilhas grandes."""
+    grid_size_deg = max(proximidade_km / 111.0, 0.0005)  # ~111km por grau, aproximação razoável perto do equador
+    buckets = {}
+    for c in collaborators:
+        if c["routeId"] is None:
+            continue
+        key = (int(c[lat_key] // grid_size_deg), int(c[lon_key] // grid_size_deg))
+        buckets.setdefault(key, []).append(c)
+
+    pares = set()
+    checados = set()
+    for c in collaborators:
+        if c["routeId"] is None:
+            continue
+        cx, cy = int(c[lat_key] // grid_size_deg), int(c[lon_key] // grid_size_deg)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for outro in buckets.get((cx + dx, cy + dy), []):
+                    if outro["id"] == c["id"]:
+                        continue
+                    par_id = frozenset({c["id"], outro["id"]})
+                    if par_id in checados:
+                        continue
+                    checados.add(par_id)
+                    if c["routeId"] == outro["routeId"]:
+                        continue
+                    dist_km = _haversine_km(c[lat_key], c[lon_key], outro[lat_key], outro[lon_key])
+                    if dist_km <= proximidade_km:
+                        pa = _round_point(c[lat_key], c[lon_key])
+                        pb = _round_point(outro[lat_key], outro[lon_key])
+                        if pa != pb:
+                            pares.add(frozenset({pa, pb}))
+    return pares
+
+
+def learn_from_scenario(project, tipo_origem, lat_key, lon_key, proximidade_km=2.0):
+    """Aprende diretamente do estado FINAL de um cenário validado — manual
+    ou automático (aprovado ou ajustado) — em vez de depender de comparar
+    com uma sugestão anterior. Isso é o que realmente implementa a
+    diretriz central do projeto ("aprender com o histórico de
+    comportamentos humanos operacionais que obtiveram sucesso"): toda rota
+    validada ensina, não só as que foram ajustadas a partir de uma sugestão
+    automática.
+
+      - Toda dupla ADJACENTE na sequência de embarque -> CONEXAO_FORTE.
+      - Toda dupla PRÓXIMA (`proximidade_km`) que ficou em rotas
+        DIFERENTES -> PENALIZACAO (o operador escolheu separá-los).
+
+    Cenários com peso 0 (AUTOMATICA_NAO_VALIDADA) não ensinam nada — são só
+    para auditoria. Best-effort: nunca lança exceção."""
+    if tipo_origem == "AUTOMATICA_NAO_VALIDADA":
+        return None
+    client = _get_client()
+    if not client:
+        return None
+
+    def _do():
+        collaborators = [c for c in project["collaborators"] if c["routeId"] is not None]
+        if len(collaborators) < 2:
+            return 0
+
+        conexoes = _consecutive_pairs_in_route(collaborators, lat_key, lon_key)
+        penalizacoes = _nearby_pairs_different_routes(collaborators, lat_key, lon_key, proximidade_km)
+
+        for pair in conexoes:
+            a, b = tuple(pair)
+            _upsert_correlacao(client, a, b, "CONEXAO_FORTE")
+        for pair in penalizacoes:
+            a, b = tuple(pair)
+            _upsert_correlacao(client, a, b, "PENALIZACAO")
+
+        return len(conexoes) + len(penalizacoes)
+
+    return _safe(_do, default=0)
+
+
 def register_feedback(project, sugestao_original, lat_key, lon_key):
     """Compara a sugestão automática original (`sugestao_original`, um
     snapshot {collab_id: routeId} tirado no momento da geração) com o
-    estado atual do projeto (o que o usuário efetivamente exportou).
-    Classifica o cenário (APROVADA se idêntico, AJUSTADA se houve qualquer
-    mudança de rota) e atualiza conexões fortes / penalizações a partir das
-    diferenças. Retorna o tipo_origem escolhido, ou None se a base de
-    conhecimento estiver desativada ou a chamada falhar."""
+    estado atual do projeto, só para CLASSIFICAR o cenário (APROVADA se
+    idêntico, AJUSTADA se houve qualquer mudança de rota). A extração de
+    conexões/penalizações em si vem de `learn_from_scenario`, que aprende
+    do estado final — não da diferença — e por isso funciona igual para
+    rotas manuais (ver `save_to_knowledge_base` em main.py). Retorna o
+    tipo_origem escolhido, ou None se a base de conhecimento estiver
+    desativada ou a chamada falhar."""
     client = _get_client()
     if not client or sugestao_original is None:
         return None
@@ -355,11 +475,12 @@ def register_feedback(project, sugestao_original, lat_key, lon_key):
         collaborators = project["collaborators"]
         by_id = {c["id"]: c for c in collaborators}
         # `sugestao_original` passa por um ciclo de serialização JSON (salvo
-        # no SQLite e recarregado) entre a geração e o download — JSON só
-        # permite chaves string, então as chaves numéricas viram string
-        # nesse meio-tempo. Normalizamos para um novo dict com chaves int
-        # (não reatribuímos o nome do parâmetro: isso o tornaria uma
-        # variável local em toda a função e quebraria a leitura acima).
+        # no SQLite/Supabase e recarregado) entre a geração e o download —
+        # JSON só permite chaves string, então as chaves numéricas viram
+        # string nesse meio-tempo. Normalizamos para um novo dict com
+        # chaves int (não reatribuímos o nome do parâmetro: isso o
+        # tornaria uma variável local em toda a função e quebraria a
+        # leitura acima).
         original_por_id = {int(cid): route_id for cid, route_id in sugestao_original.items()}
 
         mudou = any(
@@ -369,49 +490,8 @@ def register_feedback(project, sugestao_original, lat_key, lon_key):
         )
         tipo_origem = "AUTOMATICA_AJUSTADA" if mudou else "AUTOMATICA_APROVADA"
 
-        if mudou:
-            def route_groups(get_route_fn):
-                groups = {}
-                for c in collaborators:
-                    r = get_route_fn(c)
-                    if r is None:
-                        continue
-                    groups.setdefault(r, []).append(c)
-                return groups
-
-            original_groups = route_groups(lambda c: original_por_id.get(c["id"]))
-            final_groups = route_groups(lambda c: c["routeId"])
-
-            def pairs_in_groups(groups):
-                result = set()
-                for members in groups.values():
-                    ids = [m["id"] for m in members]
-                    for i in range(len(ids)):
-                        for j in range(i + 1, len(ids)):
-                            result.add(frozenset({ids[i], ids[j]}))
-                return result
-
-            pares_antes = pairs_in_groups(original_groups)
-            pares_depois = pairs_in_groups(final_groups)
-
-            separados = pares_antes - pares_depois   # estavam juntos, usuário separou
-            juntados = pares_depois - pares_antes    # não estavam juntos, usuário juntou
-
-            for pair in separados:
-                id_a, id_b = tuple(pair)
-                if id_a in by_id and id_b in by_id:
-                    pa = (by_id[id_a][lat_key], by_id[id_a][lon_key])
-                    pb = (by_id[id_b][lat_key], by_id[id_b][lon_key])
-                    _upsert_correlacao(client, _round_point(*pa), _round_point(*pb), "PENALIZACAO")
-
-            for pair in juntados:
-                id_a, id_b = tuple(pair)
-                if id_a in by_id and id_b in by_id:
-                    pa = (by_id[id_a][lat_key], by_id[id_a][lon_key])
-                    pb = (by_id[id_b][lat_key], by_id[id_b][lon_key])
-                    _upsert_correlacao(client, _round_point(*pa), _round_point(*pb), "CONEXAO_FORTE")
-
         save_scenario(project, tipo_origem, peso=1.0)
+        learn_from_scenario(project, tipo_origem, lat_key, lon_key)
         return tipo_origem
 
     return _safe(_do)

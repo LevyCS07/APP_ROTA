@@ -282,6 +282,7 @@ def project_response(project):
         # (a base de conhecimento é opcional — ver _register_knowledge).
         "conhecimentoDisponivel": kb.is_enabled(),
         "conhecimentoRegistrado": project.get("conhecimentoRegistrado", False),
+        "cenariosSimilaresUsados": project.get("cenariosSimilaresUsados", 0),
     }
 
 
@@ -383,10 +384,23 @@ async def create_project(
         lat_key = "latE" if tipo_rota == "Entrada" else "latS"
         lon_key = "lonE" if tipo_rota == "Entrada" else "lonS"
         # Best-effort: se o Supabase não estiver configurado ou a busca
-        # falhar, fetch_hints devolve um HistoricalHints vazio (sem nenhum
-        # efeito no algoritmo) — nunca interrompe a geração.
+        # falhar, essas funções devolvem valores vazios (sem nenhum efeito
+        # no algoritmo) — nunca interrompem a geração.
         hints = kb.fetch_hints(collaborators, lat_key, lon_key)
-        routes = optimizer.generate_routes(collaborators, destino, capacidade, quantidade_rotas or None, tipo_rota, config, hints)
+
+        # Usa cenários semelhantes (mesmo destino aproximado, capacidade e
+        # volume de colaboradores parecidos) para sugerir uma quantidade de
+        # rotas mais informada que o cálculo puramente matemático — só
+        # quando o usuário não informou uma quantidade explícita e não está
+        # em modo de frota fixa (que já exige um número exato à parte).
+        route_count_hint = quantidade_rotas or None
+        cenarios_similares = kb.find_similar_scenarios(destino, capacidade, len(collaborators), tipo_rota)
+        if not route_count_hint and modo_frota != "fixa" and cenarios_similares:
+            medias_rotas = [s["total_rotas"] for s in cenarios_similares if s.get("total_rotas")]
+            if medias_rotas:
+                route_count_hint = round(sum(medias_rotas) / len(medias_rotas))
+
+        routes = optimizer.generate_routes(collaborators, destino, capacidade, route_count_hint, tipo_rota, config, hints)
         # Guarda a sugestão original para comparação posterior (feedback
         # loop): ao exportar, comparamos o estado atual com este snapshot
         # para saber se o usuário aceitou a sugestão ou a ajustou.
@@ -395,6 +409,7 @@ async def create_project(
         route_count = quantidade_rotas if quantidade_rotas > 0 else 5
         routes = [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacidade} for index in range(route_count)]
         sugestao_original = None
+        cenarios_similares = []
 
     project = {
         "id": str(uuid.uuid4()),
@@ -408,6 +423,9 @@ async def create_project(
         "pesos": pesos,
         "routes": routes,
         "collaborators": collaborators,
+        # Quantos cenários semelhantes foram encontrados e usados para
+        # informar essa geração (transparência — ver project_response).
+        "cenariosSimilaresUsados": len(cenarios_similares),
         # Uso interno (feedback loop) — nunca exposto pelo project_response.
         "sugestaoOriginal": sugestao_original,
         "conhecimentoRegistrado": False,
@@ -653,6 +671,9 @@ def save_to_knowledge_base(project_id: str):
     else:
         tipo_origem = "MANUAL_VALIDADA"
         kb.save_scenario(project, tipo_origem, peso=1.0)
+        # Aprende diretamente da rota manual (conexões + penalizações) —
+        # antes só rotas automáticas ajustadas alimentavam isso.
+        kb.learn_from_scenario(project, tipo_origem, lat_key, lon_key)
 
     if tipo_origem is None:
         raise HTTPException(502, "Não foi possível salvar no Supabase agora. Confira os logs do backend.")
