@@ -24,10 +24,12 @@ try:
     from . import route_optimizer as optimizer
     from . import knowledge_base as kb
     from . import storage
+    from . import ml_pairs
 except ImportError:
     import route_optimizer as optimizer
     import knowledge_base as kb
     import storage
+    import ml_pairs
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
@@ -283,6 +285,7 @@ def project_response(project):
         "conhecimentoDisponivel": kb.is_enabled(),
         "conhecimentoRegistrado": project.get("conhecimentoRegistrado", False),
         "cenariosSimilaresUsados": project.get("cenariosSimilaresUsados", 0),
+        "mlUsado": project.get("mlUsado", False),
     }
 
 
@@ -318,6 +321,17 @@ def knowledge_stats():
     if not kb.is_enabled():
         raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
     return kb.get_stats()
+
+
+@app.get("/api/knowledge/ml-status")
+def ml_status(destino_lat: float, destino_lon: float, retrain: bool = False):
+    """Estado do modelo de ML para um destino: se está ativo, quantos
+    cenários/pares usou, AUC por validação cruzada (por cenário) e os
+    coeficientes aprendidos (interpretáveis). `retrain=true` força novo treino."""
+    if not kb.is_enabled():
+        raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
+    _model, info = ml_pairs.get_model({"lat": destino_lat, "lon": destino_lon}, force=retrain)
+    return info
 
 
 @app.post("/api/projects")
@@ -387,6 +401,11 @@ async def create_project(
         # falhar, essas funções devolvem valores vazios (sem nenhum efeito
         # no algoritmo) — nunca interrompem a geração.
         hints = kb.fetch_hints(collaborators, lat_key, lon_key)
+        # ML (opcional, best-effort): classificador de pares treinado nos
+        # cenários validados DESTE destino. Sem dados suficientes ou sem
+        # qualidade mínima (AUC), devolve `hints` inalterado.
+        hints = ml_pairs.build_ml_hints(collaborators, destino, lat_key, lon_key, hints)
+        ml_usado = hasattr(hints, "refine_groups")
 
         # Usa cenários semelhantes (mesmo destino aproximado, capacidade e
         # volume de colaboradores parecidos) para sugerir uma quantidade de
@@ -410,6 +429,7 @@ async def create_project(
         routes = [{"id": index + 1, "name": f"ROTA_{index + 1:02d}", "capacity": capacidade} for index in range(route_count)]
         sugestao_original = None
         cenarios_similares = []
+        ml_usado = False
 
     project = {
         "id": str(uuid.uuid4()),
@@ -426,6 +446,7 @@ async def create_project(
         # Quantos cenários semelhantes foram encontrados e usados para
         # informar essa geração (transparência — ver project_response).
         "cenariosSimilaresUsados": len(cenarios_similares),
+        "mlUsado": ml_usado if modo == "automatico" else False,
         # Uso interno (feedback loop) — nunca exposto pelo project_response.
         "sugestaoOriginal": sugestao_original,
         "conhecimentoRegistrado": False,
