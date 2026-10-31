@@ -855,6 +855,11 @@ def generate_routes(collaborators, destino, capacity, route_count_hint, tipo_rot
     base_groups = _split_by_direction([dict(c) for c in collaborators], route_count)
     base_groups = _rebalance_by_capacity(base_groups, capacity)
     base_groups = _rebalance_toward_target(base_groups, capacity, config.meta_ocupacao)
+    # Gancho opcional de ML: refina as fronteiras entre setores usando o
+    # modelo de afinidade de pares (ver ml_pairs.MLHints.refine_groups).
+    # Sem ML (hints sem esse método), o comportamento é idêntico ao anterior.
+    if hints is not None and hasattr(hints, "refine_groups"):
+        base_groups = hints.refine_groups(base_groups, capacity, lat_key, lon_key)
 
     candidatos = {}
 
