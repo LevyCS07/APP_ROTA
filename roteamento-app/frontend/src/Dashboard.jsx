@@ -8,12 +8,6 @@ const STATUS_LABELS = {
   AUTOMATICA_NAO_VALIDADA: 'Automáticas descartadas'
 };
 
-// 3 casas decimais (~110 m): suficiente para reconhecer a região no mapa sem
-// expor a coordenada exata de uma residência na tela (LGPD).
-function formatPonto([lat, lon]) {
-  return `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
-}
-
 function pct(value) {
   return value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`;
 }
@@ -63,19 +57,6 @@ function ApprovalChart({ serie }) {
         );
       })}
     </svg>
-  );
-}
-
-function PairList({ pairs }) {
-  return (
-    <ul className="pair-list">
-      {pairs.map((pair, index) => (
-        <li key={index}>
-          <span>{formatPonto(pair.pontoA)} ↔ {formatPonto(pair.pontoB)}</span>
-          <strong>{pair.ocorrencias}×</strong>
-        </li>
-      ))}
-    </ul>
   );
 }
 
@@ -290,21 +271,6 @@ export default function Dashboard({ onBack }) {
                   <strong>{(stats.porStatus && stats.porStatus[key]) || 0}</strong>
                 </div>
               ))}
-            </div>
-
-            <div className="dashboard-columns">
-              <div>
-                <h3 className="dashboard-section-title">Conexões fortes mais frequentes</h3>
-                <p className="muted-light small">Regiões que o time tende a juntar na mesma rota (coordenadas aproximadas).</p>
-                {stats.topConexoesFortes.length === 0 && <p className="muted-light">Nenhuma ainda.</p>}
-                <PairList pairs={stats.topConexoesFortes} />
-              </div>
-              <div>
-                <h3 className="dashboard-section-title">Penalizações mais frequentes</h3>
-                <p className="muted-light small">Regiões que o time tende a separar em rotas diferentes (coordenadas aproximadas).</p>
-                {stats.topPenalizacoes.length === 0 && <p className="muted-light">Nenhuma ainda.</p>}
-                <PairList pairs={stats.topPenalizacoes} />
-              </div>
             </div>
           </>
         )}
