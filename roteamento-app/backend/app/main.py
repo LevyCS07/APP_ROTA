@@ -323,6 +323,16 @@ def knowledge_stats():
     return kb.get_stats()
 
 
+@app.get("/api/knowledge/aprendizado")
+def knowledge_learning(treinar: bool = True, retrain: bool = False):
+    """Visão consolidada do aprendizado (Cérebro + ML) para a tela de
+    Histórico: correlações aprendidas, evolução da taxa de aprovação sem
+    ajuste, efeito do ML (com x sem) e estado do modelo por destino."""
+    if not kb.is_enabled():
+        raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
+    return kb.get_learning_overview(treinar=treinar, retrain=retrain)
+
+
 @app.get("/api/knowledge/ml-status")
 def ml_status(destino_lat: float, destino_lon: float, retrain: bool = False):
     """Estado do modelo de ML para um destino: se está ativo, quantos

@@ -563,3 +563,161 @@ def get_stats(limit_top_correlacoes=15):
         }
 
     return _safe(_do, default={"disponivel": False})
+
+
+# ---------------------------------------------------------------------------
+# Visão consolidada do aprendizado (Cérebro + ML) para o painel de Histórico
+# ---------------------------------------------------------------------------
+
+def _taxa(aprovadas, total):
+    return round(aprovadas / total, 3) if total else None
+
+
+def _agrupar_destinos(cenarios, raio_km):
+    """Agrupa cenários cujo destino está a <= raio_km do primeiro cenário do
+    grupo (mesma lógica de proximidade que o ML usa para treinar por destino)."""
+    grupos = []
+    for c in cenarios:
+        for g in grupos:
+            if _haversine_km(g["lat"], g["lon"], c["destino_lat"], c["destino_lon"]) <= raio_km:
+                g["itens"].append(c)
+                break
+        else:
+            grupos.append({"lat": c["destino_lat"], "lon": c["destino_lon"], "itens": [c]})
+    return grupos
+
+
+def get_learning_overview(treinar=True, retrain=False, max_destinos=5):
+    """Resumo do que o Cérebro e o ML já aprenderam, para o painel de
+    Histórico. Só agregados: nenhuma identidade de colaborador. Best-effort:
+    se o Supabase estiver fora, retorna {"disponivel": False}.
+
+    `treinar`: permite treinar o ML (sob demanda, com cache de 6h) para os
+    destinos com cenários suficientes. `retrain`: força novo treino."""
+    client = _get_client()
+    if not client:
+        return {"disponivel": False}
+
+    def _do():
+        try:
+            from . import ml_pairs
+        except ImportError:
+            import ml_pairs
+
+        cenarios = (
+            client.table("cenarios")
+            .select("id, app_project_id, destino_lat, destino_lon, tipo_origem, peso, criado_em")
+            .order("criado_em", desc=True)
+            .limit(1000)
+            .execute()
+            .data
+            or []
+        )
+        cenarios.reverse()  # cronológico (mais antigo -> mais novo)
+
+        validados = [c for c in cenarios if c["tipo_origem"] != "AUTOMATICA_NAO_VALIDADA" and (c.get("peso") or 0) > 0]
+        automaticos = [c for c in cenarios if c["tipo_origem"] in ("AUTOMATICA_APROVADA", "AUTOMATICA_AJUSTADA")]
+
+        # --- Cérebro: correlações aprendidas -------------------------------
+        correl = ml_pairs._fetch_all(lambda: client.table("correlacoes_pontos").select("tipo, ocorrencias"))
+        conexoes = [r for r in correl if r["tipo"] == "CONEXAO_FORTE"]
+        penal = [r for r in correl if r["tipo"] == "PENALIZACAO"]
+        cerebro = {
+            "conexoesFortes": len(conexoes),
+            "penalizacoes": len(penal),
+            "ocorrenciasTotais": sum(r.get("ocorrencias") or 0 for r in correl),
+        }
+
+        # --- Taxa de aprovação sem ajuste (e evolução) ----------------------
+        aprovadas = sum(1 for c in automaticos if c["tipo_origem"] == "AUTOMATICA_APROVADA")
+        serie = []
+        if len(automaticos) >= 4:
+            tamanho = max(3, math.ceil(len(automaticos) / 6))
+            janelas = [automaticos[i:i + tamanho] for i in range(0, len(automaticos), tamanho)]
+            if len(janelas) > 1 and len(janelas[-1]) < 2:
+                janelas[-2].extend(janelas.pop())  # sobra de 1 cenário vai para a janela anterior
+            for janela in janelas:
+                ok = sum(1 for c in janela if c["tipo_origem"] == "AUTOMATICA_APROVADA")
+                serie.append({"fim": (janela[-1].get("criado_em") or "")[:10], "taxa": _taxa(ok, len(janela)), "n": len(janela)})
+        tendencia_pp = None
+        if len(automaticos) >= 6:
+            meio = len(automaticos) // 2
+            antes, depois = automaticos[:meio], automaticos[meio:]
+            t_antes = _taxa(sum(1 for c in antes if c["tipo_origem"] == "AUTOMATICA_APROVADA"), len(antes))
+            t_depois = _taxa(sum(1 for c in depois if c["tipo_origem"] == "AUTOMATICA_APROVADA"), len(depois))
+            if t_antes is not None and t_depois is not None:
+                tendencia_pp = round((t_depois - t_antes) * 100, 1)
+        aprovacao = {
+            "taxaGeral": _taxa(aprovadas, len(automaticos)),
+            "totalAutomaticos": len(automaticos),
+            "serie": serie,
+            "tendenciaPontosPercentuais": tendencia_pp,
+        }
+
+        # --- Efeito do ML: cenários gerados com ML x sem ML ------------------
+        # Lê só o campo `mlUsado` do JSON do projeto (nunca os colaboradores).
+        def _ml_flags():
+            ids = [c["app_project_id"] for c in automaticos if c.get("app_project_id")]
+            flags = {}
+            for i in range(0, len(ids), 100):
+                rows = (
+                    client.table("projects")
+                    .select("id, ml:data->>mlUsado")
+                    .in_("id", ids[i:i + 100])
+                    .execute()
+                    .data
+                    or []
+                )
+                for r in rows:
+                    flags[r["id"]] = str(r.get("ml")).lower() == "true"
+            return flags
+
+        flags = _safe(_ml_flags, default=None)
+        efeito_ml = None
+        if flags is not None:
+            com = [c for c in automaticos if flags.get(c.get("app_project_id"))]
+            sem = [c for c in automaticos if not flags.get(c.get("app_project_id"))]
+            ok = lambda lst: sum(1 for c in lst if c["tipo_origem"] == "AUTOMATICA_APROVADA")
+            efeito_ml = {
+                "comMl": {"n": len(com), "taxa": _taxa(ok(com), len(com))},
+                "semMl": {"n": len(sem), "taxa": _taxa(ok(sem), len(sem))},
+            }
+
+        # --- ML por destino ----------------------------------------------------
+        destinos = []
+        grupos = _agrupar_destinos(validados, ml_pairs.DEST_RADIUS_KM)
+        grupos.sort(key=lambda g: -len(g["itens"]))
+        for g in grupos[:max_destinos]:
+            lat = sum(i["destino_lat"] for i in g["itens"]) / len(g["itens"])
+            lon = sum(i["destino_lon"] for i in g["itens"]) / len(g["itens"])
+            n = len(g["itens"])
+            item = {
+                "lat": round(lat, 4), "lon": round(lon, 4), "cenarios": n,
+                "minimo": ml_pairs.MIN_SCENARIOS, "ativo": False, "motivo": None,
+                "aucCv": None, "pares": None,
+            }
+            if not ml_pairs.ML_ENABLED:
+                item["motivo"] = "ML desativado (ML_ENABLED=0)"
+            elif n < ml_pairs.MIN_SCENARIOS:
+                item["motivo"] = "dados insuficientes"
+            elif treinar:
+                _model, info = ml_pairs.get_model({"lat": lat, "lon": lon}, force=retrain)
+                item.update(ativo=bool(info.get("disponivel")), motivo=info.get("motivo"),
+                            aucCv=info.get("auc_cv"), pares=info.get("pares"))
+            else:
+                item["motivo"] = "não consultado"
+            destinos.append(item)
+
+        return {
+            "disponivel": True,
+            "totalCenarios": len(cenarios),
+            "validados": len(validados),
+            "cerebro": cerebro,
+            "aprovacao": aprovacao,
+            "efeitoMl": efeito_ml,
+            "destinos": destinos,
+            "mlAtivoEm": sum(1 for d in destinos if d["ativo"]),
+            "mlHabilitado": ml_pairs.ML_ENABLED,
+        }
+
+    return _safe(_do, default={"disponivel": False})
