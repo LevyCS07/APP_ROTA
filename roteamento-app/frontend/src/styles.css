@@ -193,3 +193,32 @@ input[type="range"] { padding: 0; accent-color: #047857; }
   .dashboard-metrics { grid-template-columns: 1fr; }
   .dashboard-columns { grid-template-columns: 1fr; }
 }
+
+/* --- Histórico: aprendizado do Cérebro + ML --- */
+.brain-badge { margin: 6px 0 0; font-size: 11.5px; color: #475569; }
+.brain-badge strong.on { color: #047857; }
+.brain-badge strong.off { color: #92400e; }
+.learn-metrics { grid-template-columns: repeat(4, 1fr); }
+.metric-sub { display: block; margin-top: 4px; font-size: 11px; color: #64748b; }
+.trend-up { color: #047857; font-weight: 700; }
+.trend-down { color: #b45309; font-weight: 700; }
+.chart-box { background: #f8fafc; border-radius: 10px; padding: 10px 12px; }
+.chart-box svg { width: 100%; height: auto; display: block; }
+.compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.compare-card { background: #f1f5f9; border-radius: 10px; padding: 12px 14px; }
+.compare-card strong { font-size: 22px; color: #0f172a; }
+.dest-row { background: #f8fafc; border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; }
+.dest-top { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; color: #334155; align-items: center; }
+.progress { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+.progress > span { display: block; height: 100%; background: #7c3aed; border-radius: 999px; }
+.progress.done > span { background: #10b981; }
+.chip { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; white-space: nowrap; }
+.chip.ok { background: #d1fae5; color: #065f46; }
+.chip.wait { background: #fef3c7; color: #92400e; }
+.chip.off { background: #e2e8f0; color: #475569; }
+.dashboard-actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+.note-box { background: #fffbeb; border: 1px solid #fde68a; color: #78350f; border-radius: 8px; padding: 9px 11px; font-size: 11.5px; margin-top: 8px; }
+@media (max-width: 720px) {
+  .learn-metrics { grid-template-columns: 1fr 1fr; }
+  .compare-grid { grid-template-columns: 1fr; }
+}

@@ -72,6 +72,12 @@ export default function RoutesPanel({
       <div className="panel-header">
         <h2>Editor de rotas</h2>
         <p>Selecione pontos no mapa e envie para uma rota.</p>
+        {project.modo === 'automatico' && (
+          <p className="brain-badge" title="O Cérebro usa cenários validados parecidos; o ML ajusta as fronteiras entre rotas.">
+            🧠 Cérebro: {project.cenariosSimilaresUsados || 0} cenário(s) semelhante(s) ·{' '}
+            <strong className={project.mlUsado ? 'on' : 'off'}>ML {project.mlUsado ? 'ativo' : 'inativo'}</strong>
+          </p>
+        )}
       </div>
 
       <div className="panel-body">

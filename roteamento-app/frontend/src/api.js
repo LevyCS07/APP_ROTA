@@ -147,5 +147,10 @@ export const api = {
   // Painel do histórico (item 6).
   getKnowledgeStats() {
     return requestJson('/api/knowledge/stats');
+  },
+
+  // Aprendizado consolidado (Cérebro + ML). `retrain` força novo treino do ML.
+  getLearningOverview({ retrain = false } = {}) {
+    return requestJson(`/api/knowledge/aprendizado${retrain ? '?retrain=true' : ''}`);
   }
 };
