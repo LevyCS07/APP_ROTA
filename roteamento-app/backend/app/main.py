@@ -25,11 +25,13 @@ try:
     from . import knowledge_base as kb
     from . import storage
     from . import ml_pairs
+    from . import kml_import
 except ImportError:
     import route_optimizer as optimizer
     import knowledge_base as kb
     import storage
     import ml_pairs
+    import kml_import
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 CAMPO_NOME_BAIRRO = "Name"
@@ -334,6 +336,142 @@ def knowledge_learning(treinar: bool = True, retrain: bool = False):
     if not kb.is_enabled():
         raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
     return kb.get_learning_overview(treinar=treinar, retrain=retrain)
+
+
+def _lista_json(texto, campo):
+    try:
+        valor = json.loads(texto or "[]")
+    except json.JSONDecodeError:
+        raise HTTPException(422, f"O campo '{campo}' não é um JSON válido.")
+    if not isinstance(valor, list):
+        raise HTTPException(422, f"O campo '{campo}' deve ser uma lista.")
+    return valor
+
+
+def _inteiro_ou_none(valor, minimo=1, maximo=200):
+    try:
+        numero = int(valor)
+    except (TypeError, ValueError):
+        return None
+    return numero if minimo <= numero <= maximo else None
+
+
+def _valor_da_lista(lista, indice):
+    """Uma lista com 1 valor vale para todos os arquivos; senão, alinha por posição."""
+    if len(lista) == 1:
+        return lista[0]
+    return lista[indice] if indice < len(lista) else None
+
+
+@app.post("/api/knowledge/import-kml")
+async def import_kml(
+    files: list[UploadFile] = File(...),
+    tipo_rota: str = Form(...),
+    capacidades: str = Form("[]"),
+    alocados: str = Form("[]"),
+    confirmar: bool = Form(False),
+):
+    """Importa rotas JÁ EXISTENTES (um KML por rota; os arquivos de um mesmo
+    dia/turno/destino formam UM cenário) como cenário validado, para alimentar
+    o Cérebro e o ML sem precisar remontar as rotas no modo manual.
+
+    Sem `confirmar`: só analisa e devolve uma PRÉVIA (nada é gravado).
+    Com `confirmar=true`: grava o cenário (MANUAL_VALIDADA, peso 1). Reimportar
+    o mesmo conjunto de rotas atualiza o cenário e NÃO reconta o aprendizado.
+    Só as coordenadas são lidas — nomes e descrições do KML são ignorados."""
+    if tipo_rota not in TIPOS_ROTA:
+        raise HTTPException(422, "tipo_rota deve ser 'Entrada' ou 'Saída'.")
+    if not files or len(files) > kml_import.MAX_FILES:
+        raise HTTPException(422, f"Envie de 1 a {kml_import.MAX_FILES} arquivos KML.")
+    caps_in = _lista_json(capacidades, "capacidades")
+    aloc_in = _lista_json(alocados, "alocados")
+
+    erros, entradas = [], []
+    for indice, upload in enumerate(files):
+        nome_arquivo = upload.filename or f"arquivo{indice + 1}.kml"
+        conteudo = await upload.read(kml_import.MAX_FILE_BYTES + 1)
+        if len(conteudo) > kml_import.MAX_FILE_BYTES:
+            erros.append(f"{nome_arquivo}: maior que {kml_import.MAX_FILE_BYTES // (1024 * 1024)} MB.")
+            continue
+        try:
+            parsed = kml_import.parse_kml(conteudo, nome_arquivo)
+            rota = kml_import.resolver_rota(parsed, tipo_rota)
+        except ValueError as exc:
+            erros.append(str(exc))
+            continue
+        entradas.append((indice, nome_arquivo, parsed, rota))
+    if erros:
+        raise HTTPException(422, " | ".join(erros))
+
+    capacidades_ok = [_inteiro_ou_none(_valor_da_lista(caps_in, i)) for i, *_ in entradas]
+    avisos = []
+    for (indice, nome_arquivo, parsed, rota), cap in zip(entradas, capacidades_ok):
+        avisos.extend(rota["avisos"])
+        total = len(rota["passageiros"])
+        if cap and total > cap:
+            avisos.append(f"{rota['nome']}: {total} passageiros para capacidade {cap}.")
+        informado = _inteiro_ou_none(_valor_da_lista(aloc_in, indice), minimo=0)
+        if informado is not None and informado != total:
+            avisos.append(f"{rota['nome']}: você informou {informado} alocados, mas o KML tem {total} passageiros.")
+
+    bairros = None
+    try:
+        bairros = carregar_bairros()
+    except Exception:
+        avisos.append("Não foi possível carregar o mapa de bairros; os bairros não serão gravados.")
+    bairro_fn = (lambda lat, lon: atribuir_bairro(lat, lon, bairros)[1]) if bairros else None
+
+    projeto, avisos_projeto = kml_import.montar_projeto(
+        [e[3] for e in entradas], tipo_rota, [c or 1 for c in capacidades_ok], bairro_fn
+    )
+    avisos.extend(avisos_projeto)
+    ja_importado = kb.scenario_exists(projeto["id"]) if kb.is_enabled() else None
+
+    resposta = {
+        "confirmado": False,
+        "tipoRota": tipo_rota,
+        "destino": projeto["destino"],
+        "idCenario": projeto["id"],
+        "jaImportado": ja_importado,
+        "totalColaboradores": len(projeto["collaborators"]),
+        "rotas": [
+            {
+                "arquivo": nome_arquivo,
+                "nome": rota["nome"],
+                "passageiros": len(rota["passageiros"]),
+                "capacidade": cap,
+                "alocadosInformado": _inteiro_ou_none(_valor_da_lista(aloc_in, indice), minimo=0),
+                "distanciaKm": rota["distanciaKm"],
+                "direcaoSugerida": parsed["direcaoSugerida"],
+            }
+            for (indice, nome_arquivo, parsed, rota), cap in zip(entradas, capacidades_ok)
+        ],
+        "avisos": avisos,
+    }
+    if not confirmar:
+        return resposta
+
+    if not kb.is_enabled():
+        raise HTTPException(503, "A base de conhecimento (Supabase) não está configurada neste backend.")
+    if any(c is None for c in capacidades_ok):
+        raise HTTPException(422, "Informe a capacidade (1 a 200) de cada rota antes de importar.")
+    if len(projeto["collaborators"]) < 2:
+        raise HTTPException(422, "O cenário precisa de pelo menos 2 passageiros.")
+    if ja_importado is None:
+        raise HTTPException(502, "Não foi possível consultar o Supabase agora. Tente novamente em instantes.")
+
+    lat_key, lon_key = ("latE", "lonE") if tipo_rota == "Entrada" else ("latS", "lonS")
+    cenario_id = kb.save_scenario(projeto, "MANUAL_VALIDADA", peso=1.0)
+    if not cenario_id:
+        raise HTTPException(502, "Não foi possível salvar no Supabase agora. Confira os logs do backend.")
+    aprendizado = False
+    if not ja_importado:
+        # Só aprende na primeira vez: reimportar o mesmo cenário recontaria as
+        # conexões/penalizações (cada chamada soma ocorrências).
+        kb.learn_from_scenario(projeto, "MANUAL_VALIDADA", lat_key, lon_key)
+        aprendizado = True
+    resposta.update(confirmado=True, cenarioId=cenario_id, aprendizadoAplicado=aprendizado)
+    return resposta
 
 
 @app.get("/api/knowledge/ml-status")

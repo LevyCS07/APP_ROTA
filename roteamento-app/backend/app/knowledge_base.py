@@ -458,6 +458,21 @@ def learn_from_scenario(project, tipo_origem, lat_key, lon_key, proximidade_km=2
     return _safe(_do, default=0)
 
 
+def scenario_exists(app_project_id):
+    """True/False se já existe um cenário com esse `app_project_id`; None se
+    não foi possível consultar (base desligada ou erro). Usado pela importação
+    de KML para não contar duas vezes o aprendizado do mesmo cenário."""
+    client = _get_client()
+    if not client:
+        return None
+
+    def _do():
+        rows = client.table("cenarios").select("id").eq("app_project_id", app_project_id).limit(1).execute().data
+        return bool(rows)
+
+    return _safe(_do, default=None)
+
+
 def compute_adjustment(project, sugestao_original):
     """Mede QUANTO o usuário corrigiu a sugestão automática: a fração de
     colaboradores cuja rota mudou entre a sugestão original e o estado atual.
