@@ -4,6 +4,7 @@ import DestinationPicker from './DestinationPicker.jsx';
 import MapEditor from './MapEditor.jsx';
 import Login from './Login.jsx';
 import Dashboard from './Dashboard.jsx';
+import ImportKml from './ImportKml.jsx';
 
 // Mensagens rotativas exibidas enquanto o modo automático processa — ele
 // pode levar alguns segundos (chamadas reais ao ORS), então dar contexto
@@ -19,7 +20,7 @@ const AUTO_LOADING_HINTS = [
 export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
-  const [view, setView] = useState('setup'); // 'setup' | 'dashboard'
+  const [view, setView] = useState('setup'); // 'setup' | 'dashboard' | 'import'
 
   const [file, setFile] = useState(null);
   const [tipoRota, setTipoRota] = useState('Entrada');
@@ -123,6 +124,7 @@ export default function App() {
   if (!authenticated) return <Login onSuccess={() => setAuthenticated(true)} />;
   if (project) return <MapEditor project={project} setProject={setProject} />;
   if (view === 'dashboard') return <Dashboard onBack={() => setView('setup')} />;
+  if (view === 'import') return <ImportKml onBack={() => setView('setup')} onOpenDashboard={() => setView('dashboard')} />;
 
   return (
     <>
@@ -281,6 +283,9 @@ export default function App() {
         <div className="setup-footer-links">
           <button type="button" className="link-btn-light" onClick={() => setView('dashboard')}>
             Ver histórico de rotas
+          </button>
+          <button type="button" className="link-btn-light" onClick={() => setView('import')}>
+            Importar rotas existentes (KML)
           </button>
         </div>
       </section>

@@ -231,3 +231,17 @@ input[type="range"] { padding: 0; accent-color: #047857; }
 .verdict.ok { background: #d1fae5; color: #065f46; }
 .verdict.bad { background: #fee2e2; color: #991b1b; }
 .verdict.neutral { background: #e2e8f0; color: #334155; }
+
+/* --- Importação de rotas por KML --- */
+.import-form { display: grid; gap: 12px; margin-top: 10px; }
+.import-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.import-row label { display: grid; gap: 4px; font-size: 12px; font-weight: 600; color: #334155; }
+.import-row select, .import-row input[type='number'] { padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; }
+.import-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+.import-table th { text-align: left; color: #64748b; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #e2e8f0; }
+.import-table td { padding: 6px 8px; border-bottom: 1px solid #f1f5f9; }
+.import-table input { width: 72px; padding: 5px 7px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+.import-table input.bad { border-color: #dc2626; background: #fef2f2; }
+.table-scroll { overflow-x: auto; }
+.warn-list { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: #92400e; }
+.ok-box { background: #d1fae5; color: #065f46; border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-top: 10px; }

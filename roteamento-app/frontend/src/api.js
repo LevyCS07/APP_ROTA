@@ -149,6 +149,26 @@ export const api = {
     return requestJson('/api/knowledge/stats');
   },
 
+  // Importa rotas existentes (um KML por rota). Sem `confirmar`, devolve só a prévia.
+  async importKml(form) {
+    const res = await fetch(`${API_URL}/api/knowledge/import-kml`, { method: 'POST', body: form, headers: authHeaders() });
+    if (res.status === 401) {
+      handleUnauthorized();
+      throw new Error('Sessão expirada. Faça login novamente.');
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let message = text;
+      try {
+        message = JSON.parse(text).detail || text;
+      } catch {
+        /* resposta não era JSON */
+      }
+      throw new Error(message || `Erro ${res.status} ao importar.`);
+    }
+    return res.json();
+  },
+
   // Aprendizado consolidado (Cérebro + ML). `retrain` força novo treino do ML.
   getLearningOverview({ retrain = false } = {}) {
     return requestJson(`/api/knowledge/aprendizado${retrain ? '?retrain=true' : ''}`);
