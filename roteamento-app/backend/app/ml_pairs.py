@@ -48,6 +48,13 @@ MIN_AUC = float(os.getenv("ML_MIN_AUC", "0.62"))
 MAX_PAIRS_PER_SCENARIO = 6000
 MODEL_TTL_S = int(os.getenv("ML_MODEL_TTL_S", str(6 * 3600)))
 
+# Teste A/B randomizado (desligado por padrão). Com ML_AB=1, cada geração
+# automática cujo destino TEM modelo aprovado é sorteada: grupo "ml" (usa o
+# ML) ou "controle" (gera sem ML, mas ainda com o Cérebro). Sortear só entre
+# casos em que o ML estaria disponível mantém a comparação limpa.
+AB_MODE = os.getenv("ML_AB", "0") in ("1", "true", "True")
+AB_SHARE_ML = min(max(float(os.getenv("ML_AB_SHARE_ML", "0.5")), 0.0), 1.0)
+
 # Cenários aprovados sem nenhuma alteração são, em parte, o próprio algoritmo
 # concordando consigo mesmo (viés de confirmação) — pesam menos.
 ORIGIN_WEIGHT = {
@@ -439,6 +446,25 @@ def get_model(destino, force=False):
     info["disponivel"] = model is not None
     _MODEL_CACHE[key] = {"model": model, "info": info, "at": time.time()}
     return model, info
+
+
+def decide_ab(destino, rng=random):
+    """Decide se ESTA geração usa o ML. Retorna (grupo, usar_ml):
+      - fora do experimento (ML_AB desligado, ML desativado ou destino sem
+        modelo aprovado): (None, True) — comportamento normal;
+      - no experimento: ("ml", True) ou ("controle", False)."""
+    if not (ML_ENABLED and AB_MODE):
+        return None, True
+    try:
+        model, _info = get_model(destino)
+    except Exception:
+        logger.exception("ML: falha ao consultar modelo para o A/B — fora do experimento.")
+        return None, True
+    if model is None:
+        return None, True
+    if rng.random() < AB_SHARE_ML:
+        return "ml", True
+    return "controle", False
 
 
 def build_ml_hints(collaborators, destino, lat_key, lon_key, base_hints=None):

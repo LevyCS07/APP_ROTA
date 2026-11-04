@@ -25,6 +25,7 @@ Supabase estiver fora do ar ou nunca tiver sido configurado.
 import logging
 import math
 import os
+import random
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -457,6 +458,28 @@ def learn_from_scenario(project, tipo_origem, lat_key, lon_key, proximidade_km=2
     return _safe(_do, default=0)
 
 
+def compute_adjustment(project, sugestao_original):
+    """Mede QUANTO o usuário corrigiu a sugestão automática: a fração de
+    colaboradores cuja rota mudou entre a sugestão original e o estado atual.
+    Mais informativa que APROVADA/AJUSTADA (1 movido ≠ 20 movidos) e é a
+    métrica principal para comparar versões do gerador. Função pura (não usa
+    o banco). Retorna None se não houver sugestão original (rota manual)."""
+    if not sugestao_original:
+        return None
+    by_id = {c["id"]: c for c in project["collaborators"]}
+    # chaves numéricas viram string após o ciclo JSON salvo/recarregado
+    original = {int(cid): route_id for cid, route_id in sugestao_original.items()}
+    comparaveis = [cid for cid in original if cid in by_id]
+    if not comparaveis:
+        return None
+    movidos = sum(1 for cid in comparaveis if by_id[cid]["routeId"] != original[cid])
+    return {
+        "movidos": movidos,
+        "total": len(comparaveis),
+        "fracaoMovida": round(movidos / len(comparaveis), 4),
+    }
+
+
 def register_feedback(project, sugestao_original, lat_key, lon_key):
     """Compara a sugestão automática original (`sugestao_original`, um
     snapshot {collab_id: routeId} tirado no momento da geração) com o
@@ -569,8 +592,58 @@ def get_stats(limit_top_correlacoes=15):
 # Visão consolidada do aprendizado (Cérebro + ML) para o painel de Histórico
 # ---------------------------------------------------------------------------
 
+AB_MIN_N = 10  # mínimo de cenários COM métrica por grupo para dar um veredito
+
+
 def _taxa(aprovadas, total):
     return round(aprovadas / total, 3) if total else None
+
+
+def _media(valores):
+    valores = [v for v in valores if v is not None]
+    return round(sum(valores) / len(valores), 3) if valores else None
+
+
+def _janelas(itens):
+    """Divide itens cronológicos em até ~6 janelas (mín. 3 cada); a sobra de
+    1 item vai para a janela anterior. Menos de 4 itens => sem série."""
+    if len(itens) < 4:
+        return []
+    tamanho = max(3, math.ceil(len(itens) / 6))
+    janelas = [itens[i:i + tamanho] for i in range(0, len(itens), tamanho)]
+    if len(janelas) > 1 and len(janelas[-1]) < 2:
+        janelas[-2].extend(janelas.pop())
+    return janelas
+
+
+def _tendencia_pp(valores):
+    """Média da 2ª metade menos a da 1ª, em pontos percentuais (valores em
+    0..1, ordem cronológica). Exige pelo menos 6 valores."""
+    if len(valores) < 6:
+        return None
+    meio = len(valores) // 2
+    antes, depois = _media(valores[:meio]), _media(valores[meio:])
+    if antes is None or depois is None:
+        return None
+    return round((depois - antes) * 100, 1)
+
+
+def _permutacao_p(a, b, iteracoes=4000, seed=7):
+    """p-valor bilateral (teste de permutação) para a diferença entre as
+    médias de `a` e `b`: a chance de ver uma diferença tão grande só por
+    acaso, se os grupos fossem equivalentes. Determinístico (seed fixa)."""
+    if not a or not b:
+        return None
+    obs = abs(sum(a) / len(a) - sum(b) / len(b))
+    rng = random.Random(seed)
+    pool, na = list(a) + list(b), len(a)
+    cont = 0
+    for _ in range(iteracoes):
+        rng.shuffle(pool)
+        d = abs(sum(pool[:na]) / na - sum(pool[na:]) / (len(pool) - na))
+        if d >= obs - 1e-12:
+            cont += 1
+    return round((cont + 1) / (iteracoes + 1), 3)
 
 
 def _agrupar_destinos(cenarios, raio_km):
@@ -585,6 +658,47 @@ def _agrupar_destinos(cenarios, raio_km):
         else:
             grupos.append({"lat": c["destino_lat"], "lon": c["destino_lon"], "itens": [c]})
     return grupos
+
+
+def _stats_grupo(lista, extras):
+    ids = [c.get("app_project_id") for c in lista]
+    movs = [extras.get(i, {}).get("mov") for i in ids]
+    movs = [m for m in movs if m is not None]
+    ok = sum(1 for c in lista if c["tipo_origem"] == "AUTOMATICA_APROVADA")
+    return {"n": len(lista), "taxa": _taxa(ok, len(lista)), "mediaMovida": _media(movs), "nMovida": len(movs)}
+
+
+def _experimento_ab(automaticos, extras, ab_ativo):
+    """Resultado do teste A/B randomizado (grupo `ml` x `controle`). Desfecho
+    principal: fração média de colaboradores movidos (MENOR é melhor)."""
+    g_ml = [c for c in automaticos if extras.get(c.get("app_project_id"), {}).get("grupo") == "ml"]
+    g_ct = [c for c in automaticos if extras.get(c.get("app_project_id"), {}).get("grupo") == "controle"]
+    if not g_ml and not g_ct:
+        return {"ativo": ab_ativo, "ml": None, "controle": None, "veredito": "sem_dados"} if ab_ativo else None
+
+    def movs(lista):
+        return [m for m in (extras[c["app_project_id"]]["mov"] for c in lista) if m is not None]
+
+    m_ml, m_ct = movs(g_ml), movs(g_ct)
+    p = _permutacao_p(m_ml, m_ct)
+    diff = None
+    if m_ml and m_ct:
+        diff = round((_media(m_ml) - _media(m_ct)) * 100, 1)
+    if min(len(m_ml), len(m_ct)) < AB_MIN_N:
+        veredito = "amostra_insuficiente"
+    elif p is not None and p < 0.05:
+        veredito = "ml_melhor" if diff < 0 else "ml_pior"
+    else:
+        veredito = "sem_diferenca"
+    return {
+        "ativo": ab_ativo,
+        "ml": _stats_grupo(g_ml, extras),
+        "controle": _stats_grupo(g_ct, extras),
+        "diferencaPontosPercentuais": diff,
+        "pValor": p,
+        "minimoPorGrupo": AB_MIN_N,
+        "veredito": veredito,
+    }
 
 
 def get_learning_overview(treinar=True, retrain=False, max_destinos=5):
@@ -628,62 +742,80 @@ def get_learning_overview(treinar=True, retrain=False, max_destinos=5):
             "ocorrenciasTotais": sum(r.get("ocorrencias") or 0 for r in correl),
         }
 
-        # --- Taxa de aprovação sem ajuste (e evolução) ----------------------
+        # --- Metadados por projeto: ML usado, grupo A/B, colaboradores movidos
+        # Lê só 3 campos do JSON do projeto (nunca os colaboradores). Se o
+        # banco rejeitar os campos novos, cai para só `mlUsado`.
+        def _extras():
+            ids = [c["app_project_id"] for c in automaticos if c.get("app_project_id")]
+            out = {}
+            for i in range(0, len(ids), 100):
+                chunk = ids[i:i + 100]
+                try:
+                    rows = (
+                        client.table("projects")
+                        .select("id, ml:data->>mlUsado, grupo:data->>grupoAB, mov:data->metricaAjuste->>fracaoMovida")
+                        .in_("id", chunk).execute().data or []
+                    )
+                except Exception:
+                    rows = client.table("projects").select("id, ml:data->>mlUsado").in_("id", chunk).execute().data or []
+                for r in rows:
+                    try:
+                        mov = float(r["mov"]) if r.get("mov") not in (None, "") else None
+                    except (TypeError, ValueError):
+                        mov = None
+                    grupo = r.get("grupo")
+                    out[r["id"]] = {
+                        "ml": str(r.get("ml")).lower() == "true",
+                        "grupo": grupo if grupo in ("ml", "controle") else None,
+                        "mov": mov,
+                    }
+            return out
+
+        extras = _safe(_extras, default=None)
+
+        # --- Aprovação sem ajuste (e evolução) --------------------------------
         aprovadas = sum(1 for c in automaticos if c["tipo_origem"] == "AUTOMATICA_APROVADA")
-        serie = []
-        if len(automaticos) >= 4:
-            tamanho = max(3, math.ceil(len(automaticos) / 6))
-            janelas = [automaticos[i:i + tamanho] for i in range(0, len(automaticos), tamanho)]
-            if len(janelas) > 1 and len(janelas[-1]) < 2:
-                janelas[-2].extend(janelas.pop())  # sobra de 1 cenário vai para a janela anterior
-            for janela in janelas:
-                ok = sum(1 for c in janela if c["tipo_origem"] == "AUTOMATICA_APROVADA")
-                serie.append({"fim": (janela[-1].get("criado_em") or "")[:10], "taxa": _taxa(ok, len(janela)), "n": len(janela)})
-        tendencia_pp = None
-        if len(automaticos) >= 6:
-            meio = len(automaticos) // 2
-            antes, depois = automaticos[:meio], automaticos[meio:]
-            t_antes = _taxa(sum(1 for c in antes if c["tipo_origem"] == "AUTOMATICA_APROVADA"), len(antes))
-            t_depois = _taxa(sum(1 for c in depois if c["tipo_origem"] == "AUTOMATICA_APROVADA"), len(depois))
-            if t_antes is not None and t_depois is not None:
-                tendencia_pp = round((t_depois - t_antes) * 100, 1)
+        flags = [1.0 if c["tipo_origem"] == "AUTOMATICA_APROVADA" else 0.0 for c in automaticos]
+        serie_aprov = []
+        for janela in _janelas(list(zip(automaticos, flags))):
+            serie_aprov.append({
+                "fim": (janela[-1][0].get("criado_em") or "")[:10],
+                "taxa": _media([f for _, f in janela]),
+                "n": len(janela),
+            })
         aprovacao = {
             "taxaGeral": _taxa(aprovadas, len(automaticos)),
             "totalAutomaticos": len(automaticos),
-            "serie": serie,
-            "tendenciaPontosPercentuais": tendencia_pp,
+            "serie": serie_aprov,
+            "tendenciaPontosPercentuais": _tendencia_pp(flags),
         }
 
-        # --- Efeito do ML: cenários gerados com ML x sem ML ------------------
-        # Lê só o campo `mlUsado` do JSON do projeto (nunca os colaboradores).
-        def _ml_flags():
-            ids = [c["app_project_id"] for c in automaticos if c.get("app_project_id")]
-            flags = {}
-            for i in range(0, len(ids), 100):
-                rows = (
-                    client.table("projects")
-                    .select("id, ml:data->>mlUsado")
-                    .in_("id", ids[i:i + 100])
-                    .execute()
-                    .data
-                    or []
-                )
-                for r in rows:
-                    flags[r["id"]] = str(r.get("ml")).lower() == "true"
-            return flags
+        # --- Colaboradores movidos (métrica contínua; MENOR é melhor) ----------
+        com_metrica = []
+        if extras:
+            com_metrica = [(c, extras[c["app_project_id"]]["mov"]) for c in automaticos
+                           if extras.get(c.get("app_project_id"), {}).get("mov") is not None]
+        valores = [m for _, m in com_metrica]
+        ajuste = {
+            "media": _media(valores),
+            "n": len(valores),
+            "serie": [
+                {"fim": (j[-1][0].get("criado_em") or "")[:10], "media": _media([m for _, m in j]), "n": len(j)}
+                for j in _janelas(com_metrica)
+            ],
+            "tendenciaPontosPercentuais": _tendencia_pp(valores),
+        }
 
-        flags = _safe(_ml_flags, default=None)
-        efeito_ml = None
-        if flags is not None:
-            com = [c for c in automaticos if flags.get(c.get("app_project_id"))]
-            sem = [c for c in automaticos if not flags.get(c.get("app_project_id"))]
-            ok = lambda lst: sum(1 for c in lst if c["tipo_origem"] == "AUTOMATICA_APROVADA")
-            efeito_ml = {
-                "comMl": {"n": len(com), "taxa": _taxa(ok(com), len(com))},
-                "semMl": {"n": len(sem), "taxa": _taxa(ok(sem), len(sem))},
-            }
+        # --- Efeito do ML ----------------------------------------------------------
+        efeito_ml = None   # observacional: gerados com x sem ML (NÃO randomizado)
+        experimento = None  # teste A/B randomizado
+        if extras is not None:
+            com = [c for c in automaticos if extras.get(c.get("app_project_id"), {}).get("ml")]
+            sem = [c for c in automaticos if not extras.get(c.get("app_project_id"), {}).get("ml")]
+            efeito_ml = {"comMl": _stats_grupo(com, extras), "semMl": _stats_grupo(sem, extras)}
+            experimento = _experimento_ab(automaticos, extras, ml_pairs.AB_MODE)
 
-        # --- ML por destino ----------------------------------------------------
+        # --- ML por destino ----------------------------------------------------------
         destinos = []
         grupos = _agrupar_destinos(validados, ml_pairs.DEST_RADIUS_KM)
         grupos.sort(key=lambda g: -len(g["itens"]))
@@ -714,7 +846,9 @@ def get_learning_overview(treinar=True, retrain=False, max_destinos=5):
             "validados": len(validados),
             "cerebro": cerebro,
             "aprovacao": aprovacao,
+            "ajuste": ajuste,
             "efeitoMl": efeito_ml,
+            "experimentoAB": experimento,
             "destinos": destinos,
             "mlAtivoEm": sum(1 for d in destinos if d["ativo"]),
             "mlHabilitado": ml_pairs.ML_ENABLED,

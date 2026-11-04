@@ -285,7 +285,10 @@ def project_response(project):
         "conhecimentoDisponivel": kb.is_enabled(),
         "conhecimentoRegistrado": project.get("conhecimentoRegistrado", False),
         "cenariosSimilaresUsados": project.get("cenariosSimilaresUsados", 0),
-        "mlUsado": project.get("mlUsado", False),
+        # Em teste A/B o estado do ML NÃO é revelado na tela (revisão cega):
+        # saber se o ML estava ligado poderia enviesar quanto o usuário corrige.
+        "mlUsado": None if project.get("grupoAB") else project.get("mlUsado", False),
+        "experimentoAB": bool(project.get("grupoAB")),
     }
 
 
@@ -414,7 +417,10 @@ async def create_project(
         # ML (opcional, best-effort): classificador de pares treinado nos
         # cenários validados DESTE destino. Sem dados suficientes ou sem
         # qualidade mínima (AUC), devolve `hints` inalterado.
-        hints = ml_pairs.build_ml_hints(collaborators, destino, lat_key, lon_key, hints)
+        # Teste A/B (opcional, ML_AB=1): sorteia se esta geração usa o ML.
+        grupo_ab, usar_ml = ml_pairs.decide_ab(destino)
+        if usar_ml:
+            hints = ml_pairs.build_ml_hints(collaborators, destino, lat_key, lon_key, hints)
         ml_usado = hasattr(hints, "refine_groups")
 
         # Usa cenários semelhantes (mesmo destino aproximado, capacidade e
@@ -440,6 +446,7 @@ async def create_project(
         sugestao_original = None
         cenarios_similares = []
         ml_usado = False
+        grupo_ab = None
 
     project = {
         "id": str(uuid.uuid4()),
@@ -457,6 +464,7 @@ async def create_project(
         # informar essa geração (transparência — ver project_response).
         "cenariosSimilaresUsados": len(cenarios_similares),
         "mlUsado": ml_usado if modo == "automatico" else False,
+        "grupoAB": grupo_ab if modo == "automatico" else None,  # uso interno (A/B cego)
         # Uso interno (feedback loop) — nunca exposto pelo project_response.
         "sugestaoOriginal": sugestao_original,
         "conhecimentoRegistrado": False,
@@ -698,6 +706,9 @@ def save_to_knowledge_base(project_id: str):
     lon_key = "lonE" if project["tipoRota"] == "Entrada" else "lonS"
 
     if project.get("modo") == "automatico":
+        # Métrica contínua: fração de colaboradores que o usuário moveu em
+        # relação à sugestão automática (ver kb.compute_adjustment).
+        project["metricaAjuste"] = kb.compute_adjustment(project, project.get("sugestaoOriginal"))
         tipo_origem = kb.register_feedback(project, project.get("sugestaoOriginal"), lat_key, lon_key)
     else:
         tipo_origem = "MANUAL_VALIDADA"
