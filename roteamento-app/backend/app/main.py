@@ -787,14 +787,31 @@ def preview_route(project_id: str, route_id: int, tipo: str = "Entrada"):
     }
 
 
+ARQUIVO_POR_TIPO = {"Entrada": "entrada", "Saída": "saida"}
+
+
+def sequencia_para_tipo(rows, tipo):
+    """Sequência de paradas de uma rota para o tipo pedido.
+
+    O gerador e o editor guardam UMA ordem por rota, no sentido do destino
+    (do embarque mais distante até o último antes do destino). Entrada usa essa
+    ordem; Saída é o percurso de volta: sai do destino e desembarca primeiro
+    quem fica mais perto, ou seja, a ordem inversa."""
+    return list(rows) if tipo == "Entrada" else list(reversed(rows))
+
+
 def gerar_kml(nome_rota, tipo, rows, destino):
     lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
-    coords = [[row[lon_key], row[lat_key]] for row in rows] + [[destino["lon"], destino["lat"]]]
+    paradas = sequencia_para_tipo(rows, tipo)
+    pontos = [[row[lon_key], row[lat_key]] for row in paradas]
+    ponto_destino = [destino["lon"], destino["lat"]]
+    # Entrada termina no destino; Saída PARTE do destino.
+    coords = pontos + [ponto_destino] if tipo == "Entrada" else [ponto_destino] + pontos
     route_coords, _distancia_km, _duracao_min, _used_ors = optimizer.ors_route(coords)
     kml = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     document = etree.SubElement(kml, "Document")
     etree.SubElement(document, "name").text = f"{nome_rota} ({tipo})"
-    for row in rows:
+    for row in paradas:
         placemark = etree.SubElement(document, "Placemark")
         etree.SubElement(placemark, "name").text = row["nome"]
         point = etree.SubElement(placemark, "Point")
@@ -821,9 +838,11 @@ def download(project_id: str):
             if not rows:
                 continue
             route_filename = safe_filename(route["name"])
-            for tipo in TIPOS_ROTA:
-                zipped.writestr(f"{route_filename}_{safe_filename(tipo).lower()}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
-            report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "ZONA": row.get("zona"), "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"]} for index, row in enumerate(rows))
+            for tipo in ("Entrada", "Saída"):
+                zipped.writestr(f"{route_filename}_{ARQUIVO_POR_TIPO[tipo]}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
+            # ORDEM = embarque (sentido do destino); ORDEM SAÍDA = desembarque
+            # (a coluna nova fica por último para não deslocar as existentes).
+            report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "ZONA": row.get("zona"), "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"], "ORDEM SAÍDA": len(rows) - index} for index, row in enumerate(rows))
         spreadsheet = io.BytesIO()
         pd.DataFrame(report_rows).to_excel(spreadsheet, index=False)
         zipped.writestr("relatorio_rotas.xlsx", spreadsheet.getvalue())
