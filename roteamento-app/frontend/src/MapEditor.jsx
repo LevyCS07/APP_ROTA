@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { api } from './api.js';
 import RoutesPanel from './RoutesPanel.jsx';
+import { attachAreaSelection } from './areaSelection.js';
 
 const COLORS = [
   '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#42d4f4',
@@ -244,53 +245,27 @@ export default function MapEditor({ project, setProject }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, selected, hiddenRoutes, hiddenBairros, selectedRouteId, editingRouteId]);
 
-  // Seleção de área por arrasto (retângulo).
+  // Seleção de área por arrasto (retângulo). A lógica (botão direito, soltar
+  // fora do mapa, perda de foco) fica em areaSelection.js.
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
-    const onMouseDown = (e) => {
-      if (!selectingRef.current) return;
-      selectStartRef.current = e.latlng;
-      map.dragging.disable();
-      rectangleRef.current = L.rectangle([e.latlng, e.latlng], {
-        color: '#facc15',
-        weight: 1,
-        fillColor: '#facc15',
-        fillOpacity: 0.12
-      }).addTo(map);
-    };
-    const onMouseMove = (e) => {
-      if (!selectingRef.current || !selectStartRef.current || !rectangleRef.current) return;
-      rectangleRef.current.setBounds(L.latLngBounds(selectStartRef.current, e.latlng));
-    };
-    const onMouseUp = (e) => {
-      if (!selectingRef.current || !selectStartRef.current) return;
-      const bounds = L.latLngBounds(selectStartRef.current, e.latlng);
-      const ids = project.collaborators
-        .filter((c) => !c.routeId || !hiddenRoutes.has(c.routeId))
-        .filter((c) => !c.bairro || !hiddenBairros.has(c.bairro))
-        .filter((c) => bounds.contains(L.latLng(c.lat, c.lon)))
-        .map((c) => c.id);
-      setSelected((prev) => new Set([...prev, ...ids]));
-      if (rectangleRef.current) {
-        map.removeLayer(rectangleRef.current);
-        rectangleRef.current = null;
-      }
-      selectStartRef.current = null;
-      selectingRef.current = false;
-      setSelecting(false);
-      map.dragging.enable();
-    };
-
-    map.on('mousedown', onMouseDown);
-    map.on('mousemove', onMouseMove);
-    map.on('mouseup', onMouseUp);
-    return () => {
-      map.off('mousedown', onMouseDown);
-      map.off('mousemove', onMouseMove);
-      map.off('mouseup', onMouseUp);
-    };
+    return attachAreaSelection({
+      map,
+      L,
+      selectingRef,
+      rectangleRef,
+      selectStartRef,
+      onSelectBounds: (bounds) => {
+        const ids = project.collaborators
+          .filter((c) => !c.routeId || !hiddenRoutes.has(c.routeId))
+          .filter((c) => !c.bairro || !hiddenBairros.has(c.bairro))
+          .filter((c) => bounds.contains(L.latLng(c.lat, c.lon)))
+          .map((c) => c.id);
+        setSelected((prev) => new Set([...prev, ...ids]));
+      },
+      onDone: () => setSelecting(false)
+    });
   }, [project, hiddenRoutes, hiddenBairros]);
 
   // Envia ao backend o estado atual de atribuição de rotas (routeId de cada
