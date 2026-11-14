@@ -16,6 +16,7 @@ export default function RoutesPanel({
   onDownloadZip,
   onSaveToKnowledgeBase,
   savingKnowledge,
+  kbStatus = { state: 'idle' },
   dirty,
   canUndo,
   canRedo,
@@ -42,6 +43,38 @@ export default function RoutesPanel({
   // Painel de bairros e zonas: fechado por padrão para não ocupar espaço à toa.
   const [showRegions, setShowRegions] = useState(false);
 
+  // Formulário de nova rota (substitui o prompt() do navegador).
+  const [showNewRoute, setShowNewRoute] = useState(false);
+  const [newCap, setNewCap] = useState('');
+  const [newCapError, setNewCapError] = useState('');
+  const [creatingRoute, setCreatingRoute] = useState(false);
+
+  function openNewRoute() {
+    // Sugere a capacidade da última rota criada (ou 22, o padrão do sistema).
+    const last = project.routes[project.routes.length - 1];
+    setNewCap(String(last?.capacity ?? 22));
+    setNewCapError('');
+    setShowNewRoute(true);
+  }
+
+  function closeNewRoute() {
+    setShowNewRoute(false);
+    setNewCapError('');
+  }
+
+  async function submitNewRoute(event) {
+    event.preventDefault();
+    const capacity = Number(newCap);
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > 200) {
+      setNewCapError('Informe uma capacidade inteira entre 1 e 200.');
+      return;
+    }
+    setCreatingRoute(true);
+    const created = await onAddRoute(capacity);
+    setCreatingRoute(false);
+    if (created) closeNewRoute();
+  }
+
   const allCounts = project.routes.map((route) => ({
     ...route,
     count: project.collaborators.filter((c) => c.routeId === route.id).length
@@ -61,11 +94,22 @@ export default function RoutesPanel({
   const bairroEntries = Object.entries(bairroCounts).sort((a, b) => b[1] - a[1]);
   const zonaEntries = Object.entries(zonaCounts).sort((a, b) => b[1] - a[1]);
 
-  const knowledgeLabel = savingKnowledge
-    ? 'Salvando no histórico...'
-    : project.conhecimentoRegistrado
-      ? '✓ Salvo — salvar de novo'
-      : 'Salvar esta geração no histórico';
+  // Cartão de status na base de conhecimento (só rotas salvas ajudam a aprender).
+  const kbTitle = {
+    idle: '● Ainda não está na base de conhecimento',
+    saved: '✓ Salva na base de conhecimento',
+    stale: '● Salva, mas alterada depois'
+  }[kbStatus.state];
+  const kbSub = {
+    idle: 'Só rotas salvas ajudam o Cérebro e o ML a aprender.',
+    saved: kbStatus.label || 'Nenhuma alteração desde que foi salva.',
+    stale: 'Atualize para a base refletir a versão final.'
+  }[kbStatus.state];
+  const kbButton = savingKnowledge
+    ? 'Salvando na base...'
+    : kbStatus.state === 'stale'
+      ? 'Atualizar na base'
+      : 'Salvar na base de conhecimento';
 
   return (
     <aside className="panel">
@@ -167,8 +211,35 @@ export default function RoutesPanel({
         <section className="panel-section routes-section">
           <div className="routes-header">
             <h3 className="section-title">Rotas</h3>
-            <button type="button" className="add-route-pill" onClick={onAddRoute}>+ Nova rota</button>
+            <button type="button" className="add-route-pill" onClick={showNewRoute ? closeNewRoute : openNewRoute} aria-expanded={showNewRoute}>
+              {showNewRoute ? 'Cancelar' : '+ Nova rota'}
+            </button>
           </div>
+
+          {showNewRoute && (
+            <form className="new-route-form" onSubmit={submitNewRoute}>
+              <label htmlFor="new-route-capacity">Capacidade da nova rota</label>
+              <div className="new-route-row">
+                <input
+                  id="new-route-capacity"
+                  type="number"
+                  min="1"
+                  max="200"
+                  inputMode="numeric"
+                  autoFocus
+                  value={newCap}
+                  aria-invalid={Boolean(newCapError)}
+                  aria-describedby={newCapError ? 'new-route-error' : undefined}
+                  onChange={(e) => { setNewCap(e.target.value); setNewCapError(''); }}
+                  onKeyDown={(e) => e.key === 'Escape' && closeNewRoute()}
+                />
+                <button type="submit" className="mini create" disabled={creatingRoute}>
+                  {creatingRoute ? 'Criando…' : 'Criar'}
+                </button>
+              </div>
+              {newCapError && <p id="new-route-error" className="field-error" role="alert">{newCapError}</p>}
+            </form>
+          )}
 
           <input
             type="search"
@@ -298,14 +369,20 @@ export default function RoutesPanel({
           <button className="primary" onClick={onDownloadZip}>Baixar KMLs e relatório</button>
         </div>
         {project.conhecimentoDisponivel && (
-          <button
-            type="button"
-            className={`knowledge-btn ${project.conhecimentoRegistrado ? 'saved' : ''}`}
-            onClick={onSaveToKnowledgeBase}
-            disabled={savingKnowledge}
-          >
-            {knowledgeLabel}
-          </button>
+          <div className={`kb-card ${kbStatus.state}`}>
+            <p className="kb-title">{kbTitle}</p>
+            <p className="kb-sub">{kbSub}</p>
+            {kbStatus.state !== 'saved' && (
+              <button
+                type="button"
+                className="knowledge-btn"
+                onClick={onSaveToKnowledgeBase}
+                disabled={savingKnowledge}
+              >
+                {kbButton}
+              </button>
+            )}
+          </div>
         )}
       </div>
     </aside>

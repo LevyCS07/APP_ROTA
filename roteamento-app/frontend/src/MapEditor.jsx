@@ -2,35 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { api } from './api.js';
 import RoutesPanel from './RoutesPanel.jsx';
+import MapLegend from './MapLegend.jsx';
 import { attachAreaSelection } from './areaSelection.js';
+import { useFeedback } from './feedback.jsx';
+import { NUMBER_MIN_ZOOM, pointIconSpec, routeColor } from './mapMarkers.js';
 
-const COLORS = [
-  '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#42d4f4',
-  '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff', '#9A6324',
-  '#800000', '#808000', '#000075', '#a9a9a9'
-];
-
-function routeColor(routeId) {
-  if (!routeId) return '#111';
-  return COLORS[(routeId - 1) % COLORS.length];
-}
-
-// order !== null desenha um marcador maior com o número da sequência de embarque
-// (só usado no Estado 3 - Edição, quando uma rota está de fato sendo editada).
-function pointIcon(routeId, { selected = false, order = null } = {}) {
-  const color = routeColor(routeId);
-  const hasOrder = order !== null && order !== undefined;
-  const size = selected ? 20 : hasOrder ? 22 : routeId ? 14 : 16;
-  const radius = hasOrder || routeId ? '50%' : '3px';
-  const border = selected ? '#facc15' : '#fff';
-  const label = hasOrder
-    ? `<span style="color:#fff;font-size:11px;font-weight:800;line-height:1">${order}</span>`
-    : '';
-  return L.divIcon({
-    className: '',
-    iconAnchor: [size / 2, size / 2],
-    html: `<div style="width:${size}px;height:${size}px;border-radius:${radius};background:${color};border:3px solid ${border};box-shadow:0 1px 6px rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center">${label}</div>`
-  });
+// order !== null desenha o número da sequência de embarque (só no Estado 3 -
+// Edição); com rota atribuída, o marcador mostra o NÚMERO DA ROTA, para não
+// depender só da cor (ver mapMarkers.js).
+function pointIcon(routeId, options = {}) {
+  const { size, html } = pointIconSpec(routeId, options);
+  return L.divIcon({ className: '', iconAnchor: [size / 2, size / 2], html });
 }
 
 const EMPTY_PREVIEW = { loading: false, error: null, coordinates: [], waypoints: [], usedRealRoute: false };
@@ -41,7 +23,20 @@ function snapshotAssignments(project) {
   return project.collaborators.map((c) => `${c.id}:${c.routeId ?? ''}`).sort().join('|');
 }
 
+// Como o anterior, mas inclui a ordem de embarque: a base de conhecimento
+// também aprende com a sequência, então reordenar depois de salvar conta.
+function snapshotFull(project) {
+  return project.collaborators.map((c) => `${c.id}:${c.routeId ?? ''}:${c.order ?? ''}`).sort().join('|');
+}
+
+const KB_LABELS = {
+  AUTOMATICA_APROVADA: 'Gerada automaticamente e aprovada sem alterações',
+  AUTOMATICA_AJUSTADA: 'Gerada automaticamente e ajustada por você',
+  MANUAL_VALIDADA: 'Criada manualmente'
+};
+
 export default function MapEditor({ project, setProject }) {
+  const { toast, confirm } = useFeedback();
   const mapRef = useRef(null);
   const layerRef = useRef(null);
   const destinoMarkerRef = useRef(null);
@@ -79,6 +74,16 @@ export default function MapEditor({ project, setProject }) {
   // Persistência opcional na base de conhecimento (Supabase) — só acontece
   // quando o usuário clica no botão, nunca automaticamente.
   const [savingKnowledge, setSavingKnowledge] = useState(false);
+  // Selo de status na base: "idle" (nunca salva), "saved" ou "stale" (salva,
+  // mas a rota mudou depois). Só rotas salvas alimentam o Cérebro e o ML.
+  const kbSavedSnapshotRef = useRef(project.conhecimentoRegistrado ? snapshotFull(project) : null);
+  const [kbTipoOrigem, setKbTipoOrigem] = useState(null);
+  const nudgedKbRef = useRef(false);
+  let kbState = 'idle';
+  if (project.conhecimentoRegistrado) {
+    kbState = kbSavedSnapshotRef.current && snapshotFull(project) !== kbSavedSnapshotRef.current ? 'stale' : 'saved';
+  }
+  const kbStatus = { state: kbState, tipoOrigem: kbTipoOrigem, label: KB_LABELS[kbTipoOrigem] || null };
 
   // Desfazer/Refazer: guarda snapshots da lista de colaboradores (routeId +
   // order de cada um) antes de ações que valem a pena poder desfazer —
@@ -178,6 +183,10 @@ export default function MapEditor({ project, setProject }) {
       attribution: '© OpenStreetMap'
     }).addTo(map);
     mapRef.current = map;
+    const syncZoomClass = () =>
+      map.getContainer().classList.toggle('map-low-zoom', map.getZoom() < NUMBER_MIN_ZOOM);
+    map.on('zoomend', syncZoomClass);
+    syncZoomClass();
     layerRef.current = L.markerClusterGroup({
       spiderfyOnMaxZoom: true,
       showCoverageOnHover: false,
@@ -433,7 +442,7 @@ export default function MapEditor({ project, setProject }) {
       drawTrajeto(data.coordinates);
     } catch (err) {
       setPreview((prev) => ({ ...prev, loading: false }));
-      alert(`Não foi possível salvar a nova ordem: ${err.message}`);
+      toast.fail('Não foi possível salvar a nova ordem', err);
     }
   }
 
@@ -461,30 +470,49 @@ export default function MapEditor({ project, setProject }) {
       if (latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
     } catch (err) {
       setPreview((prev) => ({ ...prev, loading: false }));
-      alert(`Não foi possível ordenar automaticamente: ${err.message}`);
+      toast.fail('Não foi possível ordenar automaticamente', err);
     }
   }
 
-  async function addRoute() {
-    const capacity = Number(prompt('Capacidade da nova rota', '22') || 22);
-    setProject(await api.addRoute(project.id, capacity));
+  // Cria a rota com a capacidade informada no formulário do painel (antes era
+  // um prompt() do navegador). Devolve true/false para o formulário saber se fecha.
+  async function addRoute(capacity) {
+    try {
+      // O servidor devolve o projeto inteiro: sincroniza antes para não
+      // descartar atribuições feitas na tela e ainda não salvas.
+      await syncAssignments();
+      setProject(await api.addRoute(project.id, capacity));
+      toast.success(`Nova rota criada (capacidade ${capacity}).`);
+      return true;
+    } catch (err) {
+      toast.fail('Não foi possível criar a rota', err);
+      return false;
+    }
   }
 
-  // Melhoria: confirma antes de remover uma rota que ainda tem colaboradores,
-  // já que eles voltam para "sem rota" imediatamente e isso não pode ser desfeito.
+  // Confirma antes de remover uma rota que ainda tem colaboradores, já que
+  // eles voltam para "sem rota" imediatamente e isso não pode ser desfeito.
   async function removeRoute(routeId) {
     const route = project.routes.find((item) => item.id === routeId);
     const count = project.collaborators.filter((c) => c.routeId === routeId).length;
     if (count > 0) {
-      const ok = window.confirm(
-        `A rota "${route?.name || routeId}" tem ${count} colaborador(es). Remover mesmo assim? Eles ficarão sem rota.`
-      );
+      const ok = await confirm({
+        title: `Remover "${route?.name || routeId}"?`,
+        message: `${count} colaborador${count === 1 ? '' : 'es'} dessa rota ficará${count === 1 ? '' : 'rão'} sem rota. Esta ação não pode ser desfeita.`,
+        confirmLabel: 'Remover rota',
+        danger: true
+      });
       if (!ok) return;
     }
-    if (selectedRouteId === routeId) setSelectedRouteId(null);
-    if (editingRouteId === routeId) setEditingRouteId(null);
-    const updated = await api.removeRoute(project.id, routeId);
-    setProject(updated);
+    try {
+      await syncAssignments();
+      if (selectedRouteId === routeId) setSelectedRouteId(null);
+      if (editingRouteId === routeId) setEditingRouteId(null);
+      setProject(await api.removeRoute(project.id, routeId));
+      toast.success(`Rota "${route?.name || routeId}" removida.`);
+    } catch (err) {
+      toast.fail('Não foi possível remover a rota', err);
+    }
   }
 
   async function updateRouteCapacity(routeId, capacity) {
@@ -495,42 +523,94 @@ export default function MapEditor({ project, setProject }) {
         route.id === routeId ? { ...route, capacity: nextCapacity } : route
       )
     });
-    await api.updateRouteCapacity(project.id, routeId, nextCapacity);
-  }
-
-  async function downloadZip() {
-    await syncAssignments();
     try {
-      await api.downloadZip(project.id);
+      await api.updateRouteCapacity(project.id, routeId, nextCapacity);
     } catch (err) {
-      alert(`Não foi possível baixar o arquivo: ${err.message}`);
+      // `key`: digitar vários números seguidos não empilha vários avisos.
+      toast.fail('Não foi possível salvar a capacidade', err, { key: 'capacity-error' });
     }
   }
 
-  // Persistência opcional (Parte 1): só acontece quando o usuário clica.
+  async function handleSaveEdits() {
+    try {
+      await saveAssignments();
+      toast.success('Edições salvas.', { duration: 2500, key: 'edits-saved' });
+    } catch (err) {
+      toast.fail('Não foi possível salvar as edições', err);
+    }
+  }
+
+  async function downloadZip() {
+    try {
+      await syncAssignments();
+      await api.downloadZip(project.id);
+      toast.success('Arquivos baixados.', { duration: 3000, key: 'zip-downloaded' });
+      // Baixar é o fim natural do trabalho: lembra (uma vez) de salvar na base,
+      // porque só rotas salvas ajudam o sistema a aprender.
+      if (project.conhecimentoDisponivel && kbState !== 'saved' && !nudgedKbRef.current) {
+        nudgedKbRef.current = true;
+        toast.info('Quer que o sistema aprenda com esta rota?', {
+          description: 'Salvar na base ajuda o Cérebro e o ML a melhorar as próximas gerações.',
+          action: { label: 'Salvar na base', onClick: saveToKnowledgeBase },
+          duration: 15000
+        });
+      }
+    } catch (err) {
+      toast.fail('Não foi possível baixar os arquivos', err);
+    }
+  }
+
+  // Persistência opcional: só acontece quando o usuário clica (ou aceita o lembrete).
   async function saveToKnowledgeBase() {
     setSavingKnowledge(true);
     try {
-      const result = await api.saveToKnowledgeBase(project.id);
-      setProject({ ...project, conhecimentoRegistrado: true });
-      const rotulos = {
-        AUTOMATICA_APROVADA: 'aprovada sem alterações',
-        AUTOMATICA_AJUSTADA: 'gerada automaticamente e ajustada por você',
-        MANUAL_VALIDADA: 'criada manualmente'
-      };
-      alert(`Salvo no histórico como rota ${rotulos[result.tipoOrigem] || result.tipoOrigem}.`);
+      // Antes enviava só o que o servidor já tinha: "Atribuir" muda apenas a
+      // tela, então rotas editadas e não salvas iam desatualizadas para a base
+      // (e a métrica de colaboradores movidos saía errada). Sincroniza primeiro.
+      const synced = await syncAssignments();
+      const result = await api.saveToKnowledgeBase(synced.id);
+      const registered = { ...synced, conhecimentoRegistrado: true };
+      kbSavedSnapshotRef.current = snapshotFull(registered);
+      setKbTipoOrigem(result.tipoOrigem);
+      setProject(registered);
+      toast.success('Rota salva na base de conhecimento.', {
+        description: KB_LABELS[result.tipoOrigem] || undefined
+      });
     } catch (err) {
-      alert(`Não foi possível salvar no histórico: ${err.message}`);
+      toast.fail('Não foi possível salvar na base de conhecimento', err);
     } finally {
       setSavingKnowledge(false);
     }
   }
 
+  // Fechar ou recarregar a aba descarta o editor (o projeto só existe em
+  // memória na tela): avisa se há edições não salvas ou uma rota com trabalho
+  // feito que ainda não foi para a base. O texto do aviso é do navegador.
+  const hasAssigned = project.collaborators.some((c) => c.routeId);
+  const kbPending = Boolean(project.conhecimentoDisponivel) && kbState !== 'saved' && hasAssigned;
+  useEffect(() => {
+    if (!dirty && !kbPending) return undefined;
+    const onBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [dirty, kbPending]);
+
   const routeCollaborators = project.collaborators.filter((c) => c.routeId === editingRouteId);
 
   return (
     <div className="editor">
-      <div id="map" />
+      <div className="map-wrap">
+        <div id="map" />
+        <MapLegend
+          project={project}
+          hiddenRoutes={hiddenRoutes}
+          selectedRouteId={selectedRouteId}
+          onSelectRoute={selectRoute}
+        />
+      </div>
       <RoutesPanel
         project={project}
         routeColor={routeColor}
@@ -542,10 +622,11 @@ export default function MapEditor({ project, setProject }) {
         onApplySelected={applySelected}
         onClearSelection={() => setSelected(new Set())}
         onAddRoute={addRoute}
-        onSaveAssignments={() => saveAssignments()}
+        onSaveAssignments={handleSaveEdits}
         onDownloadZip={downloadZip}
         onSaveToKnowledgeBase={saveToKnowledgeBase}
         savingKnowledge={savingKnowledge}
+        kbStatus={kbStatus}
         dirty={dirty}
         canUndo={canUndo}
         canRedo={canRedo}

@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, API_URL, getToken, setUnauthorizedHandler } from './api.js';
 import DestinationPicker from './DestinationPicker.jsx';
 import MapEditor from './MapEditor.jsx';
 import Login from './Login.jsx';
 import Dashboard from './Dashboard.jsx';
 import ImportKml from './ImportKml.jsx';
+import { friendlyError } from './messages.js';
 
 // Mensagens rotativas exibidas enquanto o modo automático processa — ele
 // pode levar alguns segundos (chamadas reais ao ORS), então dar contexto
@@ -52,6 +53,11 @@ export default function App() {
   const [project, setProject] = useState(null);
   const [loading, setLoading] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
+  // Erros de preenchimento ficam no próprio campo (antes eram alert()) e o
+  // erro ao criar o projeto fica num aviso persistente com detalhes recolhidos.
+  const [formError, setFormError] = useState(null); // { field: 'file' | 'weights', message }
+  const [createError, setCreateError] = useState(null); // { message, details }
+  const fileInputRef = useRef(null);
 
   // Alterna a dica exibida na animação de carregamento enquanto o modo
   // automático está processando.
@@ -63,6 +69,10 @@ export default function App() {
     }, 2500);
     return () => clearInterval(interval);
   }, [loading, modo]);
+
+  useEffect(() => {
+    if (formError?.field === 'weights' && pesoSoma > 0) setFormError(null);
+  }, [pesoSoma, formError]);
 
   // Autenticação: valida o token guardado (se houver) uma vez, ao carregar
   // o app. Se o backend não exigir token (APP_ACCESS_TOKEN não configurado),
@@ -76,10 +86,18 @@ export default function App() {
   }, []);
 
   async function createProject() {
-    if (!file) return alert('Selecione a planilha.');
-    if (modo === 'automatico' && pesoSoma === 0) {
-      return alert('A soma dos pesos do algoritmo não pode ser zero.');
+    setCreateError(null);
+    if (!file) {
+      setFormError({ field: 'file', message: 'Selecione a planilha (.xlsx) para continuar.' });
+      fileInputRef.current?.focus();
+      return;
     }
+    if (modo === 'automatico' && pesoSoma === 0) {
+      setShowAdvanced(true); // os pesos ficam nas opções avançadas
+      setFormError({ field: 'weights', message: 'A soma dos pesos não pode ser zero. Ajuste ao menos um peso.' });
+      return;
+    }
+    setFormError(null);
     setLoading(true);
     try {
       const health = await api.health();
@@ -110,11 +128,17 @@ export default function App() {
 
       setProject(await api.createProject(form));
     } catch (err) {
-      alert(
-        `Erro ao criar projeto: ${err.message}\n\n` +
-        `API configurada no frontend: ${API_URL}\n\n` +
-        'Se a API estiver como localhost ou se o teste /api/health falhar no navegador, ajuste VITE_API_URL na Vercel e faça redeploy.'
-      );
+      const serverDown = /^Backend respondeu/.test(err?.message || '');
+      const { message, details } = friendlyError(err);
+      setCreateError({
+        message: serverDown ? 'O servidor não está respondendo agora. Tente novamente em instantes.' : message,
+        // O que antes aparecia para todo mundo agora fica recolhido (útil para quem mantém o sistema).
+        details: [
+          details || err?.message,
+          `API configurada no frontend: ${API_URL}`,
+          'Se a API estiver como localhost ou se o teste /api/health falhar no navegador, ajuste VITE_API_URL na Vercel e faça redeploy.'
+        ].filter(Boolean).join('\n\n')
+      });
     } finally {
       setLoading(false);
     }
@@ -142,8 +166,21 @@ export default function App() {
         <h1>Roteamento</h1>
         <p className="setup-subtitle">Monte rotas por seleção visual no mapa e gere KMLs por ruas com ORS.</p>
 
-        <label>Planilha Excel</label>
-        <input type="file" accept=".xlsx" onChange={(e) => setFile(e.target.files?.[0])} />
+        <label htmlFor="planilha">Planilha Excel</label>
+        <input
+          id="planilha"
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx"
+          aria-invalid={formError?.field === 'file'}
+          aria-describedby={formError?.field === 'file' ? 'planilha-erro' : undefined}
+          onChange={(e) => {
+            setFile(e.target.files?.[0]);
+            setFormError(null);
+            setCreateError(null);
+          }}
+        />
+        {formError?.field === 'file' && <p id="planilha-erro" className="field-error" role="alert">{formError.message}</p>}
 
         <div className="mode-toggle">
           <button
@@ -251,6 +288,7 @@ export default function App() {
                 </div>
 
                 <p className="weights-title">Pesos da função de custo (soma: {pesoSoma}%)</p>
+                {formError?.field === 'weights' && <p className="field-error" role="alert">{formError.message}</p>}
                 <div className="grid weights-grid">
                   <label>Tempo ({pesoTempo}%)
                     <input type="range" min="0" max="100" value={pesoTempo} onChange={(e) => setPesoTempo(Number(e.target.value))} />
@@ -276,6 +314,16 @@ export default function App() {
 
         <div className="map-label">Selecione o destino</div>
         <DestinationPicker destino={destino} setDestino={setDestino} />
+        {createError && (
+          <div className="error-banner" role="alert">
+            <strong>Não foi possível criar o projeto.</strong>
+            <p>{createError.message}</p>
+            <details>
+              <summary>Detalhes técnicos</summary>
+              <pre>{createError.details}</pre>
+            </details>
+          </div>
+        )}
         <button className="primary" disabled={loading} onClick={createProject}>
           {loading ? (modo === 'automatico' ? 'Gerando rotas...' : 'Carregando...') : 'Abrir editor'}
         </button>

@@ -10,6 +10,7 @@ import markerIcon from 'leaflet/dist/images/marker-icon.png';
 import markerShadow from 'leaflet/dist/images/marker-shadow.png';
 import './styles.css';
 import App from './App.jsx';
+import { FeedbackProvider } from './feedback.jsx';
 
 // O bundler (Vite) não resolve os caminhos padrão de ícone do Leaflet sozinho,
 // o que causa 404 em marker-icon.png/marker-shadow.png. Registramos os
@@ -21,4 +22,8 @@ L.Icon.Default.mergeOptions({
   shadowUrl: markerShadow
 });
 
-createRoot(document.getElementById('root')).render(<App />);
+createRoot(document.getElementById('root')).render(
+  <FeedbackProvider>
+    <App />
+  </FeedbackProvider>
+);
