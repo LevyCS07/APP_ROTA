@@ -159,6 +159,63 @@ def _fallback_route(coords):
     return coords, distance_km, duration_min, False
 
 
+MAX_VIAS = 20             # Pontos de passagem (desvios de trajeto) por rota, no máximo.
+
+
+def vias_aplicaveis(vias, n_coords):
+    """Quantas vias cabem no limite de waypoints do ORS (as paradas e o destino
+    já ocupam `n_coords`). Devolve a lista truncada; vazia se não houver espaço."""
+    permitidas = max(0, min(MAX_VIAS, MAX_WAYPOINTS - n_coords))
+    return list(vias or [])[:permitidas]
+
+
+def _projetar_no_segmento(p, a, b):
+    """Projeta o ponto p no segmento a-b (todos em metros, plano local).
+    Retorna (t, distancia): t em [0, 1] é a posição ao longo do segmento."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    tamanho2 = dx * dx + dy * dy
+    if tamanho2 == 0:
+        return 0.0, math.hypot(p[0] - a[0], p[1] - a[1])
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / tamanho2))
+    return t, math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy))
+
+
+def inserir_vias(coords, vias):
+    """Insere pontos de passagem ("vias") na sequência de visita.
+
+    O usuário arrasta o trajeto no mapa para fazê-lo passar por outra rua: isso
+    vira uma via, que NÃO é uma parada (não tem passageiro). Cada via entra no
+    segmento da sequência que lhe fica mais próximo, na ordem em que aparece ao
+    longo dele. Assim as vias continuam fazendo sentido se a ordem das paradas
+    mudar, e valem tanto para a Entrada quanto para a Saída (que percorre a
+    mesma sequência ao contrário).
+
+    coords: [[lon, lat], ...] na ordem de visita; vias: [{"lat", "lon"}, ...]."""
+    if not vias or len(coords) < 2:
+        return [list(c) for c in coords]
+    lat0 = sum(c[1] for c in coords) / len(coords)
+    kx, ky = 111320.0 * math.cos(math.radians(lat0)), 110574.0
+    plano = lambda lon, lat: (lon * kx, lat * ky)
+    segmentos = [(plano(*coords[i][:2]), plano(*coords[i + 1][:2])) for i in range(len(coords) - 1)]
+
+    por_segmento = {i: [] for i in range(len(segmentos))}
+    for via in vias:
+        ponto = plano(via["lon"], via["lat"])
+        melhor = None
+        for i, (a, b) in enumerate(segmentos):
+            t, distancia = _projetar_no_segmento(ponto, a, b)
+            if melhor is None or distancia < melhor[0]:
+                melhor = (distancia, i, t)
+        por_segmento[melhor[1]].append((melhor[2], [via["lon"], via["lat"]]))
+
+    saida = []
+    for i, coord in enumerate(coords[:-1]):
+        saida.append(list(coord))
+        saida.extend(v for _t, v in sorted(por_segmento[i], key=lambda item: item[0]))
+    saida.append(list(coords[-1]))
+    return saida
+
+
 def ors_route(coords):
     """Retorna (coordenadas, distancia_km, duracao_min, usou_ors) para a
     sequência completa de pontos, já na ordem de visita definida pelo

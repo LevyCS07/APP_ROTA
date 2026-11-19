@@ -279,6 +279,8 @@ def project_response(project):
         "modoFrota": project.get("modoFrota", "minimizar"),
         "metaOcupacao": project.get("metaOcupacao", 0.85),
         "limiteMinutos": project.get("limiteMinutos", 90),
+        # Avisa ao frontend que este servidor sabe guardar pontos de passagem.
+        "viasSuportadas": True,
         "pesos": project.get("pesos", {"tempo": 0.40, "coerencia": 0.25, "distancia": 0.20, "ocupacao": 0.15}),
         "routes": project["routes"],
         "collaborators": project["collaborators"],
@@ -664,6 +666,17 @@ class RouteOrderPayload(BaseModel):
     order: list[int]
 
 
+class ViaPoint(BaseModel):
+    lat: float
+    lon: float
+
+
+class RouteViasPayload(BaseModel):
+    # Pontos de passagem da rota: desvios no trajeto que o usuário arrastou no
+    # mapa. Não são paradas. A lista inteira substitui a anterior.
+    vias: list[ViaPoint] = []
+
+
 @app.post("/api/projects/{project_id}/routes")
 def add_route(project_id: str, payload: RoutePayload):
     if payload.capacity < 1:
@@ -731,6 +744,29 @@ def reorder_route(project_id: str, route_id: int, payload: RouteOrderPayload):
     return project_response(project)
 
 
+@app.put("/api/projects/{project_id}/routes/{route_id}/vias")
+def set_route_vias(project_id: str, route_id: int, payload: RouteViasPayload):
+    """Define os pontos de passagem do trajeto de uma rota (desvios arrastados no
+    mapa). Eles afetam o trajeto e a distância/tempo do preview e a linha do KML,
+    mas NÃO criam paradas. A lista enviada substitui a anterior."""
+    project = load_project(project_id)
+    route = next((route for route in project["routes"] if route["id"] == route_id), None)
+    if not route:
+        raise HTTPException(404, "Rota não encontrada.")
+    vias = []
+    for via in payload.vias:
+        if not (math.isfinite(via.lat) and math.isfinite(via.lon)) or not (-90 <= via.lat <= 90 and -180 <= via.lon <= 180):
+            raise HTTPException(422, "Ponto de passagem com coordenadas inválidas.")
+        vias.append({"lat": round(via.lat, 6), "lon": round(via.lon, 6)})
+    paradas = sum(1 for c in project["collaborators"] if c["routeId"] == route_id)
+    permitidas = max(0, min(optimizer.MAX_VIAS, optimizer.MAX_WAYPOINTS - (paradas + 1)))
+    if len(vias) > permitidas:
+        raise HTTPException(422, f"Esta rota permite no máximo {permitidas} ponto(s) de passagem (o trajeto aceita até {optimizer.MAX_WAYPOINTS} pontos).")
+    route["vias"] = vias
+    save_project(project)
+    return project_response(project)
+
+
 @app.post("/api/projects/{project_id}/routes/{route_id}/auto-order")
 def auto_order_route(project_id: str, route_id: int, tipo: str = "Entrada"):
     """Ordena automaticamente a sequência de embarque de uma rota:
@@ -773,7 +809,8 @@ def preview_route(project_id: str, route_id: int, tipo: str = "Entrada"):
         return {"waypoints": [], "coordinates": [], "usedOrs": False}
     lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
     coords = [[row[lon_key], row[lat_key]] for row in rows] + [[project["destino"]["lon"], project["destino"]["lat"]]]
-    route_coords, distancia_km, duracao_min, used_ors = optimizer.ors_route(coords)
+    vias = optimizer.vias_aplicaveis(route.get("vias"), len(coords))
+    route_coords, distancia_km, duracao_min, used_ors = optimizer.ors_route(optimizer.inserir_vias(coords, vias))
     waypoints = [
         {"id": row["id"], "nome": row["nome"], "lat": row[lat_key], "lon": row[lon_key], "order": index + 1}
         for index, row in enumerate(rows)
@@ -784,6 +821,8 @@ def preview_route(project_id: str, route_id: int, tipo: str = "Entrada"):
         "usedOrs": used_ors,
         "distanciaKm": round(distancia_km, 2),
         "duracaoMin": round(duracao_min, 1),
+        "vias": vias,
+        "maxVias": max(0, min(optimizer.MAX_VIAS, optimizer.MAX_WAYPOINTS - len(coords))),
     }
 
 
@@ -800,13 +839,15 @@ def sequencia_para_tipo(rows, tipo):
     return list(rows) if tipo == "Entrada" else list(reversed(rows))
 
 
-def gerar_kml(nome_rota, tipo, rows, destino):
+def gerar_kml(nome_rota, tipo, rows, destino, vias=None):
     lat_key, lon_key = ("latE", "lonE") if tipo == "Entrada" else ("latS", "lonS")
     paradas = sequencia_para_tipo(rows, tipo)
     pontos = [[row[lon_key], row[lat_key]] for row in paradas]
     ponto_destino = [destino["lon"], destino["lat"]]
     # Entrada termina no destino; Saída PARTE do destino.
     coords = pontos + [ponto_destino] if tipo == "Entrada" else [ponto_destino] + pontos
+    # Desvios arrastados no mapa entram só na LINHA do trajeto; nunca viram Placemark.
+    coords = optimizer.inserir_vias(coords, optimizer.vias_aplicaveis(vias, len(coords)))
     route_coords, _distancia_km, _duracao_min, _used_ors = optimizer.ors_route(coords)
     kml = etree.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     document = etree.SubElement(kml, "Document")
@@ -839,7 +880,7 @@ def download(project_id: str):
                 continue
             route_filename = safe_filename(route["name"])
             for tipo in ("Entrada", "Saída"):
-                zipped.writestr(f"{route_filename}_{ARQUIVO_POR_TIPO[tipo]}.kml", gerar_kml(route["name"], tipo, rows, project["destino"]))
+                zipped.writestr(f"{route_filename}_{ARQUIVO_POR_TIPO[tipo]}.kml", gerar_kml(route["name"], tipo, rows, project["destino"], route.get("vias")))
             # ORDEM = embarque (sentido do destino); ORDEM SAÍDA = desembarque
             # (a coluna nova fica por último para não deslocar as existentes).
             report_rows.extend({"ROTA": route["name"], "ORDEM": index + 1, "COLABORADOR": row["nome"], "BAIRRO": row["bairro"], "ZONA": row.get("zona"), "LAT E": row["latE"], "LONG E": row["lonE"], "LAT S": row["latS"], "LONG S": row["lonS"], "ORDEM SAÍDA": len(rows) - index} for index, row in enumerate(rows))
