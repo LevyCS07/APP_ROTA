@@ -34,7 +34,7 @@ export const NUMBER_MIN_ZOOM = 12;
 // HTML do marcador. Atribuído a uma rota => círculo COM O NÚMERO DA ROTA
 // (identificação além da cor); em edição de ordem => número de embarque;
 // sem rota => quadrado pequeno e escuro. `size` é devolvido para o anchor.
-export function pointIconSpec(routeId, { selected = false, order = null } = {}) {
+export function pointIconSpec(routeId, { selected = false, order = null, overlap = false, cid = null } = {}) {
   const color = routeColor(routeId);
   const hasOrder = order !== null && order !== undefined;
   // Tamanhos totais (com borda) iguais aos de antes: sem rota é maior para chamar atenção.
@@ -49,7 +49,7 @@ export function pointIconSpec(routeId, { selected = false, order = null } = {}) 
     ? `<span class="pt-num" style="color:${textColor};font-size:${fontSize}px">${text}</span>`
     : '';
   const html =
-    `<div class="pt" style="width:${size}px;height:${size}px;border-radius:${radius};background:${color};` +
-    `border:2px solid ${border};box-shadow:0 1px 6px rgba(0,0,0,.55)">${label}</div>`;
+    `<div class="pt"${cid !== null ? ` data-cid="${cid}"` : ''} style="width:${size}px;height:${size}px;border-radius:${radius};background:${color};` +
+    `border:2px solid ${border};box-shadow:0 1px 6px rgba(0,0,0,.55)${overlap ? ';outline:3px solid #ef4444;outline-offset:1px' : ''}">${label}</div>`;
   return { size, html };
 }

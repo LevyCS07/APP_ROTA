@@ -106,6 +106,14 @@ export const api = {
 
   // Ordena automaticamente: começa no colaborador mais distante do destino e
   // encadeia pelo vizinho mais próximo até o fim da rota.
+  // Pontos de passagem (desvios do trajeto arrastados no mapa); substitui a lista.
+  setRouteVias(projectId, routeId, vias) {
+    return requestJson(`/api/projects/${projectId}/routes/${routeId}/vias`, {
+      method: 'PUT',
+      body: JSON.stringify({ vias })
+    });
+  },
+
   autoOrderRoute(projectId, routeId, tipo) {
     return requestJson(`/api/projects/${projectId}/routes/${routeId}/auto-order?tipo=${encodeURIComponent(tipo)}`, {
       method: 'POST'

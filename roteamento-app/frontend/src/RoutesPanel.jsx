@@ -1,5 +1,10 @@
 import { useState } from 'react';
 import RouteOrderList from './RouteOrderList.jsx';
+import OverviewPanel from './OverviewPanel.jsx';
+
+const km = (value) => value.toFixed(1).replace('.', ',');
+const signed = (value, digits = 1) =>
+  `${value > 0 ? '+' : value < 0 ? '−' : '±'}${Math.abs(value).toFixed(digits).replace('.', ',')}`;
 
 export default function RoutesPanel({
   project,
@@ -35,7 +40,28 @@ export default function RoutesPanel({
   routeCollaborators,
   onReorderRoute,
   onAutoOrderRoute,
-  preview
+  preview,
+  // Visão geral de todas as rotas
+  panelView = 'rotas',
+  onPanelViewChange = () => {},
+  overview,
+  overviewOptions,
+  onOverviewOptionsChange,
+  computingReal = null,
+  onComputeReal,
+  onCancelComputeReal,
+  // Edição da ordem e do trajeto
+  sequence = null,
+  onStartSequence,
+  onSequenceUndo,
+  onSequenceFinish,
+  onSequenceCancel,
+  onFocusCollaborator,
+  onHoverCollaborator,
+  routeVias = [],
+  maxVias = null,
+  onRemoveVia,
+  onClearVias
 }) {
   // Seletor de rotas pesquisável — essencial quando há muitas rotas geradas
   // automaticamente e o usuário quer achar uma específica rápido.
@@ -128,7 +154,30 @@ export default function RoutesPanel({
         )}
       </div>
 
+      <div className="panel-tabs" role="tablist" aria-label="Modo do painel">
+        <button type="button" role="tab" aria-selected={panelView === 'rotas'} className={panelView === 'rotas' ? 'active' : ''} onClick={() => onPanelViewChange('rotas')}>
+          Rotas
+        </button>
+        <button type="button" role="tab" aria-selected={panelView === 'visao'} className={panelView === 'visao' ? 'active' : ''} onClick={() => onPanelViewChange('visao')}>
+          Visão geral
+        </button>
+      </div>
+
       <div className="panel-body">
+        {panelView === 'visao' && overview ? (
+          <OverviewPanel
+            overview={overview}
+            options={overviewOptions}
+            onOptionsChange={onOverviewOptionsChange}
+            selectedRouteId={selectedRouteId}
+            onSelectRoute={onSelectRoute}
+            hiddenRoutes={hiddenRoutes}
+            computing={computingReal}
+            onComputeReal={onComputeReal}
+            onCancelCompute={onCancelComputeReal}
+          />
+        ) : (
+        <>
         {/* Fluxo do dia a dia: os dois passos que você repete o tempo todo
             ficam juntos, numerados, e a ação de atribuir só liga quando
             existe seleção — reduz clique em botão errado. */}
@@ -314,31 +363,86 @@ export default function RoutesPanel({
                           Estado 3 (Edição) — modo ativo de modificação. */}
                       {isEditing && (
                         <div className="route-details">
-                          {preview.loading && <span className="status">Calculando trajeto...</span>}
-                          {preview.error && <span className="status error">{preview.error}</span>}
-                          {!preview.loading && !preview.error && (
-                            <span className="status">
-                              {preview.usedRealRoute
-                                ? 'Trajeto calculado pelas ruas (ORS).'
-                                : 'Linha reta entre os pontos (defina ORS_API_KEY no backend para trajeto real).'}
-                            </span>
-                          )}
+                          <div className="trajeto-status">
+                            {preview.loading && <span className="status">Atualizando trajeto…</span>}
+                            {preview.error && <span className="status error">{preview.error}</span>}
+                            {!preview.loading && !preview.error && (
+                              <span className="status">
+                                {preview.usedRealRoute
+                                  ? 'Trajeto pelas ruas (ORS).'
+                                  : 'Linha reta entre os pontos (defina ORS_API_KEY no backend para trajeto real).'}
+                              </span>
+                            )}
+                            {typeof preview.distanciaKm === 'number' && (
+                              <span className="trajeto-totals" title="Distância e tempo do trajeto atual">
+                                <strong>{km(preview.distanciaKm)} km</strong> · <strong>{Math.round(preview.duracaoMin)} min</strong>
+                                {preview.delta && (
+                                  <span className="deltas" title="Variação em relação ao trajeto anterior">
+                                    <em className={`delta ${preview.delta.km > 0.05 ? 'worse' : preview.delta.km < -0.05 ? 'better' : ''}`}>{signed(preview.delta.km)} km</em>
+                                    <em className={`delta ${preview.delta.min > 0.5 ? 'worse' : preview.delta.min < -0.5 ? 'better' : ''}`}>{signed(preview.delta.min, 0)} min</em>
+                                  </span>
+                                )}
+                              </span>
+                            )}
+                          </div>
+
                           <button
                             type="button"
                             className="auto-order-btn"
-                            disabled={preview.loading || routeCollaborators.length < 2}
+                            disabled={routeCollaborators.length < 2 || Boolean(sequence)}
                             onClick={() => onAutoOrderRoute(route.id)}
                           >
                             Ordenar automaticamente (mais distante → destino)
                           </button>
-                          <p className="muted small">
-                            Arraste um colaborador para reposicionar, ou use as setas para ajustes finos.
-                          </p>
-                          <RouteOrderList
-                            collaborators={routeCollaborators}
-                            onReorder={onReorderRoute}
-                            disabled={preview.loading}
-                          />
+
+                          {sequence ? (
+                            <div className="sequence-banner" role="status">
+                              <strong>Clique nos pontos desta rota, no mapa, na ordem em que devem ser visitados.</strong>
+                              <span>
+                                {sequence.picked.length} de {routeCollaborators.length} escolhidos · os que você não clicar ficam no fim, na ordem atual.
+                              </span>
+                              <div className="sequence-actions">
+                                <button type="button" className="mini" onClick={onSequenceUndo} disabled={sequence.picked.length === 0}>↶ Desfazer último</button>
+                                <button type="button" className="mini create" onClick={onSequenceFinish} disabled={sequence.picked.length === 0}>Concluir</button>
+                                <button type="button" className="mini" onClick={onSequenceCancel}>Cancelar (Esc)</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <RouteOrderList
+                              collaborators={routeCollaborators}
+                              destino={project.destino}
+                              onReorder={onReorderRoute}
+                              onFocusCollaborator={onFocusCollaborator}
+                              onHoverCollaborator={onHoverCollaborator}
+                              onStartSequence={onStartSequence}
+                            />
+                          )}
+
+                          {project.viasSuportadas && (
+                            <div className="vias-section">
+                              <h4>Ajustar trajeto no mapa</h4>
+                              <p className="muted small">
+                                Arraste a linha da rota para desviar por outra rua. Arraste o pino azul para ajustar;
+                                duplo clique ou botão direito no pino o remove.
+                              </p>
+                              {routeVias.length > 0 && (
+                                <ul className="vias-list">
+                                  {routeVias.map((via, index) => (
+                                    <li key={`${via.lat}-${via.lon}-${index}`}>
+                                      <span>Ponto de passagem {index + 1}</span>
+                                      <button type="button" aria-label={`Remover ponto de passagem ${index + 1}`} onClick={() => onRemoveVia(index)}>✕</button>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                              <div className="vias-footer">
+                                <span className="muted small">{routeVias.length}/{maxVias ?? '—'} pontos de passagem</span>
+                                {routeVias.length > 0 && (
+                                  <button type="button" className="mini" onClick={onClearVias}>Remover todos</button>
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -352,6 +456,8 @@ export default function RoutesPanel({
             )}
           </div>
         </section>
+        </>
+        )}
       </div>
 
       <div className="panel-footer">

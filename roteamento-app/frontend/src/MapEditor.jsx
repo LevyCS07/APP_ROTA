@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
 import { api } from './api.js';
 import RoutesPanel from './RoutesPanel.jsx';
@@ -6,6 +6,10 @@ import MapLegend from './MapLegend.jsx';
 import { attachAreaSelection } from './areaSelection.js';
 import { useFeedback } from './feedback.jsx';
 import { NUMBER_MIN_ZOOM, pointIconSpec, routeColor } from './mapMarkers.js';
+import { applyOrder, completeSequence, orderedIds, sameIds } from './orderUtils.js';
+import { computeOverview, routeSignature } from './routeMetrics.js';
+import { drawOverview } from './overviewLayers.js';
+import { attachViaCreate } from './trajectoryEditing.js';
 
 // order !== null desenha o número da sequência de embarque (só no Estado 3 -
 // Edição); com rota atribuída, o marcador mostra o NÚMERO DA ROTA, para não
@@ -15,7 +19,20 @@ function pointIcon(routeId, options = {}) {
   return L.divIcon({ className: '', iconAnchor: [size / 2, size / 2], html });
 }
 
-const EMPTY_PREVIEW = { loading: false, error: null, coordinates: [], waypoints: [], usedRealRoute: false };
+const EMPTY_PREVIEW = {
+  loading: false,
+  error: null,
+  coordinates: [],
+  waypoints: [],
+  usedRealRoute: false,
+  distanciaKm: null,
+  duracaoMin: null,
+  maxVias: null,
+  delta: null // variação de km/min em relação ao trajeto anterior (após uma edição)
+};
+
+const round6 = (value) => Math.round(value * 1e6) / 1e6;
+const COMMIT_DELAY_MS = 450; // espera o usuário parar de mexer antes de falar com o servidor
 
 // Serializa apenas o routeId de cada colaborador, para comparar "o que está
 // salvo no servidor" com "o que está na tela" (ver estado `dirty`).
@@ -63,6 +80,44 @@ export default function MapEditor({ project, setProject }) {
   const [editingRouteId, setEditingRouteId] = useState(null);
 
   const [preview, setPreview] = useState(EMPTY_PREVIEW);
+
+  // Painel: "rotas" (edição) ou "visao" (todas as rotas juntas, para medir o conjunto).
+  const [panelView, setPanelView] = useState('rotas');
+  const [overviewOptions, setOverviewOptions] = useState({ areas: true, lines: true, real: false });
+  const [routePreviews, setRoutePreviews] = useState({}); // trajetos reais já calculados, por rota
+  const [computingReal, setComputingReal] = useState(null); // { done, total } enquanto calcula
+  const computeTokenRef = useRef(0);
+  const overviewLayerRef = useRef(null);
+
+  // Modo "definir a ordem clicando nos pontos do mapa".
+  const [sequence, setSequence] = useState(null); // null | { picked: [ids] }
+  const sequenceRef = useRef(null);
+  sequenceRef.current = sequence;
+  const sequenceActionsRef = useRef({});
+
+  // Edição com a tela na frente: a lista e o mapa mudam NA HORA; o servidor é
+  // atualizado em segundo plano (ver scheduleCommit). Os refs dão aos
+  // callbacks do Leaflet sempre o valor mais recente.
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  const editingRouteIdRef = useRef(null);
+  editingRouteIdRef.current = editingRouteId;
+  const commitTimerRef = useRef(null);
+  const syncChainRef = useRef(Promise.resolve());
+  const previewTokenRef = useRef(0);
+  const prevTotalsRef = useRef(null); // { routeId, km, min } do último trajeto mostrado
+  const maxViasRef = useRef(null);
+  const editVersionRef = useRef(0);
+  const [unsynced, setUnsynced] = useState(false); // há ordem/desvios só na tela
+  const hoverRef = useRef(null);
+
+  // Desvios (pontos de passagem) do trajeto.
+  const viasLayerRef = useRef(null);
+  const viaDetachRef = useRef(null);
+  const viaActionsRef = useRef({});
+
+  // Resumo de TODAS as rotas (visão geral).
+  const overview = useMemo(() => computeOverview(project, routePreviews), [project, routePreviews]);
   // Espelha selectingRef em estado só para dar feedback visual no botão
   // "Selecionar área" (o ref sozinho é o que os handlers do mapa usam de fato).
   const [selecting, setSelecting] = useState(false);
@@ -109,6 +164,7 @@ export default function MapEditor({ project, setProject }) {
     redoStackRef.current.push(project.collaborators);
     setProject((current) => ({ ...current, collaborators: previous }));
     setDirty(true);
+    scheduleCommit(); // a ordem desfeita também precisa chegar ao servidor
     setCanUndo(undoStackRef.current.length > 0);
     setCanRedo(true);
   }
@@ -119,6 +175,7 @@ export default function MapEditor({ project, setProject }) {
     undoStackRef.current.push(project.collaborators);
     setProject((current) => ({ ...current, collaborators: next }));
     setDirty(true);
+    scheduleCommit();
     setCanUndo(true);
     setCanRedo(redoStackRef.current.length > 0);
   }
@@ -144,13 +201,19 @@ export default function MapEditor({ project, setProject }) {
   function setSelectMode(value) {
     selectingRef.current = value;
     setSelecting(value);
+    if (value) updateSequence(null); // os dois modos usam o clique no mapa: um de cada vez
   }
 
   // Melhoria: tecla Esc cancela o modo "Selecionar área" a qualquer momento,
   // inclusive no meio de um arrasto em andamento.
   useEffect(() => {
     function onKeyDown(e) {
-      if (e.key !== 'Escape' || !selectingRef.current) return;
+      if (e.key !== 'Escape') return;
+      if (sequenceRef.current) {
+        updateSequence(null);
+        return;
+      }
+      if (!selectingRef.current) return;
       const map = mapRef.current;
       if (rectangleRef.current && map) {
         map.removeLayer(rectangleRef.current);
@@ -203,25 +266,39 @@ export default function MapEditor({ project, setProject }) {
     if (!map || !layer) return;
     layer.clearLayers();
     markersRef.current = {};
+    // Modo "clicar no mapa": quem já foi escolhido mostra o novo número.
+    const seqIndex = new Map((sequence?.picked || []).map((id, index) => [id, index + 1]));
 
     project.collaborators.forEach((collab) => {
       if (collab.routeId && hiddenRoutes.has(collab.routeId)) return;
       if (collab.bairro && hiddenBairros.has(collab.bairro)) return;
       const isSelected = selected.has(collab.id);
       const route = project.routes.find((item) => item.id === collab.routeId);
-      const order = collab.routeId === editingRouteId ? orderByCollabId.get(collab.id) : null;
+      const inSequence = Boolean(sequence) && collab.routeId === editingRouteId;
+      const order = inSequence
+        ? seqIndex.get(collab.id) ?? null
+        : collab.routeId === editingRouteId
+          ? orderByCollabId.get(collab.id)
+          : null;
+      const overlap = panelView === 'visao' && overview.overlapIds.has(collab.id);
       const tooltip = collab.routeId
         ? `${order ? `#${order} · ` : ''}${collab.nome} (${route?.name || `Rota ${collab.routeId}`})`
         : `${collab.nome} (sem rota)`;
       const marker = L.marker([collab.lat, collab.lon], {
-        icon: pointIcon(collab.routeId, { selected: isSelected, order })
+        icon: pointIcon(collab.routeId, { selected: isSelected, order, overlap, cid: collab.id })
       }).bindTooltip(tooltip);
       // Estado 2 (Foco) e Estado 3 (Edição): esmaece tudo que não pertence à
       // rota selecionada, para ela se destacar visualmente no mapa.
       if (selectedRouteId) {
         marker.setOpacity(collab.routeId === selectedRouteId ? 1 : 0.22);
       }
+      // No modo "clicar no mapa" os ainda não escolhidos ficam meio apagados.
+      if (inSequence) marker.setOpacity(seqIndex.has(collab.id) ? 1 : 0.55);
       marker.on('click', () => {
+        if (sequenceRef.current) {
+          sequenceActionsRef.current.click(collab);
+          return;
+        }
         setSelected((prev) => {
           const next = new Set(prev);
           if (next.has(collab.id)) next.delete(collab.id);
@@ -251,8 +328,9 @@ export default function MapEditor({ project, setProject }) {
       map.fitBounds(bounds.pad(0.15));
       fittedProjectRef.current = project.id;
     }
+    highlightCollaborator(hoverRef.current); // mantém o destaque do item sob o mouse
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, selected, hiddenRoutes, hiddenBairros, selectedRouteId, editingRouteId]);
+  }, [project, selected, hiddenRoutes, hiddenBairros, selectedRouteId, editingRouteId, sequence, panelView, overview]);
 
   // Seleção de área por arrasto (retângulo). A lógica (botão direito, soltar
   // fora do mapa, perda de foco) fica em areaSelection.js.
@@ -284,37 +362,180 @@ export default function MapEditor({ project, setProject }) {
   // embarque) passam a rejeitar os dados por não baterem com o que já foi
   // salvo. Por isso ela é chamada automaticamente antes dessas ações, além de
   // poder ser disparada manualmente pelo botão "Salvar edições".
-  async function syncAssignments(nextProject = project) {
-    const payload = {};
-    nextProject.collaborators.forEach((c) => {
-      payload[c.id] = c.routeId || null;
-    });
-    const updated = await api.saveAssignments(project.id, payload);
-    savedSnapshotRef.current = snapshotAssignments(updated);
-    setDirty(false);
-    return updated;
+  // Fila: duas sincronizações nunca rodam ao mesmo tempo (a última escrita vence).
+  function enqueue(task) {
+    const run = syncChainRef.current.then(task, task);
+    syncChainRef.current = run.catch(() => {});
+    return run;
   }
 
-  async function saveAssignments(nextProject = project) {
-    setProject(await syncAssignments(nextProject));
+  // Envia ao servidor a ORDEM de embarque que só existe na tela (reordenar,
+  // desfazer/refazer). Compara rota a rota e só manda o que mudou.
+  async function flushOrders(local, server) {
+    let current = server;
+    const routeIds = [...new Set(local.collaborators.filter((c) => c.routeId).map((c) => c.routeId))];
+    for (const routeId of routeIds) {
+      const localIds = orderedIds(local.collaborators, routeId);
+      if (sameIds(localIds, orderedIds(current.collaborators, routeId))) continue;
+      current = await api.reorderRoute(current.id, routeId, localIds);
+    }
+    return current;
+  }
+
+  // Idem para os desvios (pontos de passagem) do trajeto. Servidores antigos
+  // não os conhecem (`viasSuportadas` ausente): nesse caso não há o que enviar.
+  async function flushVias(local, server) {
+    if (!server.viasSuportadas) return server;
+    let current = server;
+    for (const route of local.routes) {
+      const serverRoute = current.routes.find((item) => item.id === route.id);
+      if (!serverRoute) continue;
+      if (JSON.stringify(route.vias || []) === JSON.stringify(serverRoute.vias || [])) continue;
+      try {
+        current = await api.setRouteVias(current.id, route.id, route.vias || []);
+      } catch (err) {
+        // Recusado (ex.: limite de pontos): a tela volta ao que o servidor tem.
+        const kept = serverRoute.vias || [];
+        setProject((now) => ({ ...now, routes: now.routes.map((item) => (item.id === route.id ? { ...item, vias: kept } : item)) }));
+        throw err;
+      }
+    }
+    return current;
+  }
+
+  // Leva ao servidor TUDO o que está só na tela: atribuições, ordem e desvios.
+  // Retorna o projeto como o servidor o tem depois disso.
+  function syncAssignments(nextProject) {
+    return enqueue(async () => {
+      const local = nextProject || projectRef.current;
+      const version = editVersionRef.current;
+      const payload = {};
+      local.collaborators.forEach((c) => {
+        payload[c.id] = c.routeId || null;
+      });
+      let updated = await api.saveAssignments(local.id, payload);
+      updated = await flushOrders(local, updated);
+      updated = await flushVias(local, updated);
+      savedSnapshotRef.current = snapshotAssignments(updated);
+      setDirty(false);
+      if (editVersionRef.current === version) setUnsynced(false); // nada novo na tela enquanto salvava
+      return updated;
+    });
+  }
+
+  async function saveAssignments(nextProject) {
+    const local = nextProject || projectRef.current;
+    const updated = await syncAssignments(local);
+    // Se o usuário mexeu de novo enquanto salvava, mantém a tela dele.
+    if (projectRef.current === local) setProject(updated);
+  }
+
+  function removeTrajeto() {
+    if (viaDetachRef.current) {
+      viaDetachRef.current();
+      viaDetachRef.current = null;
+    }
+    if (trajetoLayerRef.current) {
+      mapRef.current.removeLayer(trajetoLayerRef.current);
+      trajetoLayerRef.current = null;
+    }
   }
 
   function drawTrajeto(coordinates) {
     const map = mapRef.current;
-    if (trajetoLayerRef.current) {
-      map.removeLayer(trajetoLayerRef.current);
-      trajetoLayerRef.current = null;
-    }
+    removeTrajeto();
     if (coordinates?.length > 1) {
       const latlngs = coordinates.map(([lon, lat]) => [lat, lon]);
-      trajetoLayerRef.current = L.polyline(latlngs, {
-        color: routeColor(editingRouteId),
+      const visible = L.polyline(latlngs, {
+        color: routeColor(editingRouteIdRef.current),
         weight: 4,
-        opacity: 0.85
-      }).addTo(map);
+        opacity: 0.85,
+        interactive: false
+      });
+      const layers = [visible];
+      if (projectRef.current.viasSuportadas) {
+        // Linha larga e invisível por cima: alvo fácil para agarrar com o mouse
+        // e arrastar o trajeto (cria um ponto de passagem onde soltar).
+        const hit = L.polyline(latlngs, { weight: 18, opacity: 0, bubblingMouseEvents: false });
+        hit.bindTooltip('Arraste para desviar o trajeto', { sticky: true });
+        layers.push(hit);
+        viaDetachRef.current = attachViaCreate({
+          map,
+          L,
+          line: hit,
+          canStart: () => !selectingRef.current && !sequenceRef.current,
+          onCreate: (latlng) => viaActionsRef.current.addVia(latlng)
+        });
+      }
+      trajetoLayerRef.current = L.layerGroup(layers).addTo(map);
       return latlngs;
     }
     return null;
+  }
+
+  // Mostra um trajeto recém-calculado (totais, variação e linha no mapa) e o
+  // guarda para a visão geral.
+  function applyPreview(data, routeId, { compare = false, fit = false } = {}) {
+    const previous = prevTotalsRef.current;
+    const delta =
+      compare && previous && previous.routeId === routeId
+        ? { km: data.distanciaKm - previous.km, min: data.duracaoMin - previous.min }
+        : null;
+    prevTotalsRef.current = { routeId, km: data.distanciaKm, min: data.duracaoMin };
+    maxViasRef.current = data.maxVias ?? null;
+    setPreview({
+      loading: false,
+      error: null,
+      coordinates: data.coordinates,
+      waypoints: data.waypoints,
+      usedRealRoute: Boolean(data.usedOrs),
+      distanciaKm: data.distanciaKm,
+      duracaoMin: data.duracaoMin,
+      maxVias: data.maxVias ?? null,
+      delta
+    });
+    setRoutePreviews((prev) => ({
+      ...prev,
+      [routeId]: {
+        sig: routeSignature(projectRef.current, routeId),
+        distanciaKm: data.distanciaKm,
+        duracaoMin: data.duracaoMin,
+        usedOrs: Boolean(data.usedOrs),
+        coordinates: data.coordinates
+      }
+    }));
+    const latlngs = drawTrajeto(data.coordinates);
+    if (fit && latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+  }
+
+  // Agenda o envio das edições ao servidor (ordem, desfazer/refazer, desvios).
+  // Esperar o usuário parar de mexer evita uma ida ao servidor por clique e
+  // mantém a interface fluida; antes de baixar/salvar tudo é enviado de qualquer jeito.
+  function scheduleCommit() {
+    editVersionRef.current += 1;
+    setUnsynced(true);
+    clearTimeout(commitTimerRef.current);
+    commitTimerRef.current = setTimeout(commitEdits, COMMIT_DELAY_MS);
+  }
+
+  async function commitEdits() {
+    commitTimerRef.current = null; // já disparou: não há mais envio agendado
+    const routeId = editingRouteIdRef.current;
+    const token = ++previewTokenRef.current;
+    setPreview((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const synced = await syncAssignments();
+      if (!routeId) {
+        setPreview((prev) => ({ ...prev, loading: false }));
+        return;
+      }
+      const data = await api.previewRoute(synced.id, routeId, synced.tipoRota);
+      if (token !== previewTokenRef.current) return; // veio uma edição mais nova; ela refaz o trajeto
+      applyPreview(data, routeId, { compare: true });
+    } catch (err) {
+      if (token === previewTokenRef.current) setPreview((prev) => ({ ...prev, loading: false }));
+      toast.fail('Não foi possível enviar a alteração ao servidor', err, { key: 'commit-error' });
+    }
   }
 
   // Busca e desenha o trajeto real da rota em edição (Estado 3). Sincroniza
@@ -322,10 +543,8 @@ export default function MapEditor({ project, setProject }) {
   // reflita qualquer edição local ainda não salva.
   useEffect(() => {
     if (!editingRouteId) {
-      if (trajetoLayerRef.current) {
-        mapRef.current.removeLayer(trajetoLayerRef.current);
-        trajetoLayerRef.current = null;
-      }
+      removeTrajeto();
+      prevTotalsRef.current = null;
       setPreview(EMPTY_PREVIEW);
       return;
     }
@@ -335,20 +554,13 @@ export default function MapEditor({ project, setProject }) {
 
     (async () => {
       try {
-        const synced = await syncAssignments();
+        const local = projectRef.current;
+        const synced = await syncAssignments(local);
         if (cancelled) return;
-        setProject(synced);
+        if (projectRef.current === local) setProject(synced);
         const data = await api.previewRoute(synced.id, editingRouteId, synced.tipoRota);
         if (cancelled) return;
-        setPreview({
-          loading: false,
-          error: null,
-          coordinates: data.coordinates,
-          waypoints: data.waypoints,
-          usedRealRoute: Boolean(data.usedOrs)
-        });
-        const latlngs = drawTrajeto(data.coordinates);
-        if (latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+        applyPreview(data, editingRouteId, { fit: true });
       } catch (err) {
         if (cancelled) return;
         setPreview({ ...EMPTY_PREVIEW, error: err.message || 'Não foi possível calcular o trajeto.' });
@@ -423,27 +635,14 @@ export default function MapEditor({ project, setProject }) {
     setEditingRouteId((current) => (current === routeId ? null : routeId));
   }
 
-  async function reorderFocusedRoute(orderedIds) {
-    if (!editingRouteId) return;
-    pushHistory(project.collaborators);
-    setPreview((prev) => ({ ...prev, loading: true }));
-    try {
-      const synced = await syncAssignments();
-      const updated = await api.reorderRoute(synced.id, editingRouteId, orderedIds);
-      setProject(updated);
-      const data = await api.previewRoute(updated.id, editingRouteId, updated.tipoRota);
-      setPreview({
-        loading: false,
-        error: null,
-        coordinates: data.coordinates,
-        waypoints: data.waypoints,
-        usedRealRoute: Boolean(data.usedOrs)
-      });
-      drawTrajeto(data.coordinates);
-    } catch (err) {
-      setPreview((prev) => ({ ...prev, loading: false }));
-      toast.fail('Não foi possível salvar a nova ordem', err);
-    }
+  // Reordena a rota em edição. A lista e o mapa mudam NA HORA (nada fica
+  // bloqueado esperando o servidor); o envio e o novo trajeto vêm em segundo plano.
+  function reorderFocusedRoute(newOrder) {
+    const routeId = editingRouteIdRef.current;
+    if (!routeId) return;
+    pushHistory(projectRef.current.collaborators);
+    setProject((current) => ({ ...current, collaborators: applyOrder(current.collaborators, routeId, newOrder) }));
+    scheduleCommit();
   }
 
   // Ordena automaticamente a rota em edição: começa no colaborador mais
@@ -452,22 +651,16 @@ export default function MapEditor({ project, setProject }) {
   // já tem as coordenadas de todos os colaboradores.
   async function autoOrderFocusedRoute(routeId) {
     if (!routeId) return;
-    pushHistory(project.collaborators);
+    pushHistory(projectRef.current.collaborators);
+    const token = ++previewTokenRef.current;
     setPreview((prev) => ({ ...prev, loading: true }));
     try {
       const synced = await syncAssignments();
       const updated = await api.autoOrderRoute(synced.id, routeId, synced.tipoRota);
       setProject(updated);
       const data = await api.previewRoute(updated.id, routeId, updated.tipoRota);
-      setPreview({
-        loading: false,
-        error: null,
-        coordinates: data.coordinates,
-        waypoints: data.waypoints,
-        usedRealRoute: Boolean(data.usedOrs)
-      });
-      const latlngs = drawTrajeto(data.coordinates);
-      if (latlngs) mapRef.current.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+      if (token !== previewTokenRef.current) return;
+      applyPreview(data, routeId, { compare: true, fit: true });
     } catch (err) {
       setPreview((prev) => ({ ...prev, loading: false }));
       toast.fail('Não foi possível ordenar automaticamente', err);
@@ -589,14 +782,245 @@ export default function MapEditor({ project, setProject }) {
   const hasAssigned = project.collaborators.some((c) => c.routeId);
   const kbPending = Boolean(project.conhecimentoDisponivel) && kbState !== 'saved' && hasAssigned;
   useEffect(() => {
-    if (!dirty && !kbPending) return undefined;
+    if (!dirty && !kbPending && !unsynced) return undefined;
     const onBeforeUnload = (event) => {
       event.preventDefault();
       event.returnValue = '';
     };
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [dirty, kbPending]);
+  }, [dirty, kbPending, unsynced]);
+
+  // Ao sair do editor com um envio ainda agendado, manda agora: não perde a edição.
+  useEffect(
+    () => () => {
+      if (commitTimerRef.current) {
+        clearTimeout(commitTimerRef.current);
+        commitTimerRef.current = null;
+        syncAssignments().catch(() => {});
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  // ---------- Modo "definir a ordem clicando nos pontos do mapa"
+  function updateSequence(next) {
+    sequenceRef.current = next; // imediato: dois cliques seguidos não se perdem
+    setSequence(next);
+  }
+
+  function startSequence() {
+    const routeId = editingRouteIdRef.current;
+    if (!routeId || orderedIds(projectRef.current.collaborators, routeId).length < 2) return;
+    setSelectMode(false);
+    updateSequence({ picked: [] });
+  }
+
+  function undoSequence() {
+    const current = sequenceRef.current;
+    if (current && current.picked.length) updateSequence({ picked: current.picked.slice(0, -1) });
+  }
+
+  // Os pontos escolhidos vêm primeiro, na ordem dos cliques; os não clicados
+  // seguem depois, na ordem em que já estavam. Vale como UMA alteração só
+  // (um Ctrl+Z desfaz tudo).
+  function finishSequence(picked = sequenceRef.current?.picked) {
+    if (!picked || picked.length === 0) return;
+    const current = orderedIds(projectRef.current.collaborators, editingRouteIdRef.current);
+    updateSequence(null);
+    reorderFocusedRoute(completeSequence(picked, current));
+  }
+
+  function handleSequenceClick(collab) {
+    const current = sequenceRef.current;
+    if (!current) return;
+    if (collab.routeId !== editingRouteIdRef.current) {
+      toast.info('Clique apenas nos pontos da rota em edição.', { key: 'seq-wrong', duration: 2500 });
+      return;
+    }
+    if (current.picked.includes(collab.id)) {
+      // Clicar de novo no último escolhido desfaz esse clique.
+      if (current.picked[current.picked.length - 1] === collab.id) undoSequence();
+      return;
+    }
+    const picked = [...current.picked, collab.id];
+    const total = orderedIds(projectRef.current.collaborators, editingRouteIdRef.current).length;
+    if (picked.length >= total) finishSequence(picked);
+    else updateSequence({ picked });
+  }
+  sequenceActionsRef.current = { click: handleSequenceClick };
+
+  // Sair da edição (ou trocar de rota) encerra o modo.
+  useEffect(() => {
+    updateSequence(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingRouteId]);
+
+  // ---------- Ligação lista <-> mapa
+  function highlightCollaborator(id) {
+    const previous = hoverRef.current;
+    if (previous !== null && previous !== undefined && previous !== id) {
+      markersRef.current[previous]?.getElement()?.classList.remove('pt-hover');
+    }
+    hoverRef.current = id;
+    if (id !== null && id !== undefined) markersRef.current[id]?.getElement()?.classList.add('pt-hover');
+  }
+
+  // Clicar no nome na lista leva o mapa até o ponto (abre o grupo, se estiver agrupado).
+  function focusCollaborator(id) {
+    const marker = markersRef.current[id];
+    const map = mapRef.current;
+    if (!marker || !map) return;
+    layerRef.current.zoomToShowLayer(marker, () => {
+      map.panTo(marker.getLatLng());
+      marker.openTooltip();
+    });
+  }
+
+  // ---------- Visão geral de todas as rotas
+  function changePanelView(view) {
+    setPanelView(view);
+    updateSequence(null);
+    if (view === 'visao') {
+      setEditingRouteId(null);
+      const map = mapRef.current;
+      if (map && project.collaborators.length) {
+        const bounds = L.latLngBounds(project.collaborators.map((c) => [c.lat, c.lon]));
+        bounds.extend([project.destino.lat, project.destino.lon]);
+        map.fitBounds(bounds.pad(0.15));
+      }
+    }
+  }
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (!overviewLayerRef.current) overviewLayerRef.current = L.layerGroup().addTo(map);
+    const group = overviewLayerRef.current;
+    if (panelView !== 'visao') {
+      group.clearLayers();
+      return;
+    }
+    drawOverview({
+      L,
+      group,
+      project,
+      overview,
+      options: overviewOptions,
+      hiddenRoutes,
+      selectedRouteId,
+      routeColor,
+      previews: routePreviews
+    });
+  }, [panelView, project, overview, overviewOptions, hiddenRoutes, selectedRouteId, routePreviews]);
+
+  // Calcula o trajeto real (ORS) de cada rota com gente, uma de cada vez
+  // (respeita o limite de requisições do ORS) e mostra o progresso.
+  async function computeAllPreviews() {
+    const token = ++computeTokenRef.current;
+    const current = projectRef.current;
+    const routes = current.routes.filter((route) => current.collaborators.some((c) => c.routeId === route.id));
+    setComputingReal({ done: 0, total: routes.length });
+    try {
+      const synced = await syncAssignments();
+      let done = 0;
+      for (const route of routes) {
+        if (token !== computeTokenRef.current) return; // cancelado
+        const data = await api.previewRoute(synced.id, route.id, synced.tipoRota);
+        setRoutePreviews((prev) => ({
+          ...prev,
+          [route.id]: {
+            sig: routeSignature(projectRef.current, route.id),
+            distanciaKm: data.distanciaKm,
+            duracaoMin: data.duracaoMin,
+            usedOrs: Boolean(data.usedOrs),
+            coordinates: data.coordinates
+          }
+        }));
+        done += 1;
+        setComputingReal({ done, total: routes.length });
+      }
+      setOverviewOptions((options) => ({ ...options, real: true }));
+    } catch (err) {
+      toast.fail('Não foi possível calcular os trajetos', err);
+    } finally {
+      if (token === computeTokenRef.current) setComputingReal(null);
+    }
+  }
+
+  function cancelComputeAll() {
+    computeTokenRef.current += 1;
+    setComputingReal(null);
+  }
+
+  // ---------- Ajuste do trajeto: pontos de passagem (desvios)
+  const editingRoute = project.routes.find((route) => route.id === editingRouteId);
+  const routeVias = (editingRoute && editingRoute.vias) || [];
+
+  function currentVias() {
+    const route = projectRef.current.routes.find((item) => item.id === editingRouteIdRef.current);
+    return (route && route.vias) || [];
+  }
+
+  function setRouteViasLocal(routeId, vias) {
+    setProject((current) => ({
+      ...current,
+      routes: current.routes.map((route) => (route.id === routeId ? { ...route, vias } : route))
+    }));
+    scheduleCommit();
+  }
+
+  function addVia(latlng) {
+    const routeId = editingRouteIdRef.current;
+    if (!routeId) return;
+    const vias = currentVias();
+    if (maxViasRef.current !== null && vias.length >= maxViasRef.current) {
+      toast.info(`Esta rota já usa o máximo de ${maxViasRef.current} pontos de passagem.`, { key: 'vias-max' });
+      return;
+    }
+    setRouteViasLocal(routeId, [...vias, { lat: round6(latlng.lat), lon: round6(latlng.lng) }]);
+  }
+
+  function moveVia(index, latlng) {
+    const vias = currentVias().map((via, i) => (i === index ? { lat: round6(latlng.lat), lon: round6(latlng.lng) } : via));
+    setRouteViasLocal(editingRouteIdRef.current, vias);
+  }
+
+  const removeVia = (index) => setRouteViasLocal(editingRouteIdRef.current, currentVias().filter((_, i) => i !== index));
+  const clearVias = () => setRouteViasLocal(editingRouteIdRef.current, []);
+  viaActionsRef.current = { addVia, moveVia, removeVia, clearVias };
+
+  // Pinos dos desvios da rota em edição: arrastar ajusta; duplo clique ou
+  // botão direito remove.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (!viasLayerRef.current) viasLayerRef.current = L.layerGroup().addTo(map);
+    const group = viasLayerRef.current;
+    group.clearLayers();
+    if (!editingRouteId || !project.viasSuportadas) return;
+    routeVias.forEach((via, index) => {
+      const marker = L.marker([via.lat, via.lon], {
+        draggable: true,
+        keyboard: false,
+        zIndexOffset: 800,
+        icon: L.divIcon({ className: '', iconSize: [20, 20], iconAnchor: [10, 10], html: `<div class="via-pin">${index + 1}</div>` })
+      });
+      marker.bindTooltip(`Ponto de passagem ${index + 1} — arraste para ajustar; duplo clique remove`);
+      marker.on('dragend', () => viaActionsRef.current.moveVia(index, marker.getLatLng()));
+      marker.on('dblclick', (e) => {
+        L.DomEvent.stopPropagation(e);
+        viaActionsRef.current.removeVia(index);
+      });
+      marker.on('contextmenu', (e) => {
+        L.DomEvent.preventDefault(e.originalEvent);
+        viaActionsRef.current.removeVia(index);
+      });
+      group.addLayer(marker);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingRouteId, JSON.stringify(routeVias), project.viasSuportadas]);
 
   const routeCollaborators = project.collaborators.filter((c) => c.routeId === editingRouteId);
 
@@ -646,6 +1070,25 @@ export default function MapEditor({ project, setProject }) {
         onReorderRoute={reorderFocusedRoute}
         onAutoOrderRoute={autoOrderFocusedRoute}
         preview={preview}
+        panelView={panelView}
+        onPanelViewChange={changePanelView}
+        overview={overview}
+        overviewOptions={overviewOptions}
+        onOverviewOptionsChange={setOverviewOptions}
+        computingReal={computingReal}
+        onComputeReal={computeAllPreviews}
+        onCancelComputeReal={cancelComputeAll}
+        sequence={sequence}
+        onStartSequence={startSequence}
+        onSequenceUndo={undoSequence}
+        onSequenceFinish={() => finishSequence()}
+        onSequenceCancel={() => updateSequence(null)}
+        onFocusCollaborator={focusCollaborator}
+        onHoverCollaborator={highlightCollaborator}
+        routeVias={routeVias}
+        maxVias={preview.maxVias}
+        onRemoveVia={(index) => viaActionsRef.current.removeVia(index)}
+        onClearVias={() => viaActionsRef.current.clearVias()}
       />
     </div>
   );

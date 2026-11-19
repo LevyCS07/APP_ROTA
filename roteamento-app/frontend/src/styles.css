@@ -325,3 +325,93 @@ input[aria-invalid="true"] { border-color: #dc2626; background: #fef2f2; }
 .legend-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .legend-count { color: #94a3b8; font-variant-numeric: tabular-nums; }
 .map-legend button:focus-visible { outline: 3px solid #facc15; outline-offset: 1px; }
+
+/* ===== Abas do painel: Rotas | Visão geral ===== */
+.panel-tabs { display: flex; gap: 4px; padding: 8px 12px 0; background: #111827; flex: none; }
+.panel-tabs button { flex: 1; background: #1f2937; color: #94a3b8; font-size: 12px; font-weight: 700; padding: 8px; border-radius: 8px 8px 0 0; }
+.panel-tabs button.active { background: #0b1220; color: #fff; box-shadow: inset 0 -2px 0 #6366f1; }
+.panel-tabs button:focus-visible { outline: 3px solid #facc15; outline-offset: -2px; }
+
+/* ===== Visão geral ===== */
+.overview-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 6px; }
+.ov-card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 8px 9px; display: grid; gap: 2px; }
+.ov-card span { font-size: 10.5px; color: #94a3b8; }
+.ov-card strong { font-size: 17px; color: #fff; line-height: 1.1; }
+.ov-card small { font-size: 10px; color: #94a3b8; line-height: 1.25; }
+.ov-card.warn { border-color: #b45309; }
+.ov-card.warn strong { color: #fcd34d; }
+.overview-layers { display: flex; gap: 12px; flex-wrap: wrap; border: 1px solid #374151; border-radius: 8px; padding: 6px 10px 8px; margin: 0; }
+.overview-layers legend { font-size: 10.5px; color: #94a3b8; padding: 0 4px; }
+.overview-layers label { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #e5e7eb; }
+.overview-compute { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mini.accent { background: #4f46e5; }
+.overview-table { width: 100%; border-collapse: collapse; font-size: 11.5px; color: #e5e7eb; }
+.overview-table th { text-align: left; padding: 0; border-bottom: 1px solid #374151; }
+.overview-table th button { background: transparent; color: #94a3b8; font-size: 10.5px; font-weight: 700; padding: 6px 5px; width: 100%; text-align: left; }
+.overview-table th button:hover { color: #fff; background: rgba(255,255,255,.05); }
+.overview-table td { padding: 6px 5px; border-bottom: 1px solid #1f2937; vertical-align: top; white-space: nowrap; }
+.overview-table tbody tr { cursor: pointer; }
+.overview-table tbody tr:hover { background: rgba(255,255,255,.05); }
+.overview-table tbody tr.selected { background: rgba(250, 204, 21, .14); outline: 1px solid #facc15; outline-offset: -1px; }
+.overview-table tr.hidden-route { opacity: .45; }
+.overview-table td.bad { color: #fca5a5; font-weight: 800; }
+.ov-swatch { display: inline-flex; width: 20px; height: 20px; border-radius: 50%; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; border: 2px solid #fff; box-sizing: border-box; vertical-align: middle; margin-right: 6px; }
+.ov-name { font-weight: 700; vertical-align: middle; }
+.ov-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; white-space: normal; }
+.flag { font-style: normal; font-size: 9.5px; padding: 1px 6px; border-radius: 999px; background: #374151; color: #cbd5e1; }
+.flag.bad { background: #7f1d1d; color: #fecaca; }
+.flag.warn { background: #78350f; color: #fde68a; }
+.occ-bar { display: inline-block; width: 34px; height: 6px; background: #374151; border-radius: 999px; overflow: hidden; vertical-align: middle; margin-right: 5px; }
+.occ-bar i { display: block; height: 100%; border-radius: 999px; }
+
+/* ===== Lista de ordem (substitui a versão rígida) ===== */
+.order-list-wrap { display: grid; gap: 6px; }
+.order-toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
+.order-list { max-height: 320px; }
+.order-list.disabled { opacity: .6; }
+.order-list li.order-item { display: block; position: relative; padding: 5px 7px 4px; cursor: grab; outline: none; }
+.order-list li.order-item:focus-visible { outline: 2px solid #facc15; outline-offset: -2px; }
+.order-list li.order-item:hover { background: #273449; }
+.order-list li.order-item.dragging { opacity: .4; }
+.order-list li.order-item.drop-before::before,
+.order-list li.order-item.drop-after::after { content: ''; position: absolute; left: 4px; right: 4px; height: 3px; background: #facc15; border-radius: 2px; }
+.order-list li.order-item.drop-before::before { top: -3px; }
+.order-list li.order-item.drop-after::after { bottom: -3px; }
+.order-row { display: grid; grid-template-columns: 14px 24px 1fr auto; align-items: center; gap: 6px; }
+button.order-badge { padding: 0; width: 24px; height: 22px; border-radius: 6px; background: #374151; }
+button.order-badge:hover { background: #4f46e5; }
+.pos-input { width: 100%; box-sizing: border-box; padding: 2px 3px; text-align: center; font-size: 12px; background: #0b1220; color: #fff; border: 1px solid #facc15; border-radius: 5px; }
+button.order-name { background: transparent; color: #e5e7eb; text-align: left; padding: 2px 0; font-weight: 600; }
+button.order-name:hover { color: #fff; text-decoration: underline; }
+.order-actions button { background: #374151; color: #e5e7eb; }
+.order-actions button:hover:not(:disabled) { background: #4f46e5; }
+.order-actions button:disabled { opacity: .3; cursor: default; }
+.order-list button:focus-visible, .order-toolbar button:focus-visible { outline: 2px solid #facc15; outline-offset: 1px; }
+.leg { display: block; margin: 2px 0 0 44px; font-size: 10px; color: #94a3b8; }
+.leg.long { color: #fcd34d; font-weight: 700; }
+
+/* ===== Definir a ordem clicando no mapa ===== */
+.sequence-banner { display: grid; gap: 6px; background: #1e1b4b; border: 1px solid #6366f1; border-radius: 8px; padding: 10px; font-size: 12px; }
+.sequence-banner span { font-size: 11px; color: #c7d2fe; }
+.sequence-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ===== Totais do trajeto e variação ===== */
+.trajeto-status { display: grid; gap: 4px; }
+.trajeto-totals { font-size: 12px; color: #e5e7eb; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.deltas { display: inline-flex; gap: 4px; }
+.delta { font-style: normal; font-size: 10.5px; font-weight: 800; padding: 1px 6px; border-radius: 999px; background: #374151; color: #cbd5e1; }
+.delta.better { background: #064e3b; color: #a7f3d0; }
+.delta.worse { background: #78350f; color: #fde68a; }
+
+/* ===== Ajuste do trajeto (pontos de passagem) ===== */
+.vias-section { display: grid; gap: 6px; border-top: 1px solid #263244; padding-top: 8px; }
+.vias-section h4 { margin: 0; font-size: 12px; color: #e5e7eb; }
+.vias-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.vias-list li { display: flex; justify-content: space-between; align-items: center; background: #1f2937; border-radius: 6px; padding: 4px 8px; font-size: 11.5px; }
+.vias-list button { background: transparent; color: #fca5a5; padding: 2px 6px; }
+.vias-footer { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.via-pin { width: 20px; height: 20px; box-sizing: border-box; border-radius: 50%; background: #2563eb; color: #fff; border: 2px solid #fff; font-size: 10px; font-weight: 800; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 6px rgba(0,0,0,.6); cursor: grab; }
+
+/* ===== Ligação lista <-> mapa ===== */
+.leaflet-marker-icon.pt-hover { z-index: 9999 !important; }
+.pt-hover .pt { transform: scale(1.45); box-shadow: 0 0 0 4px rgba(250, 204, 21, .85), 0 2px 8px rgba(0,0,0,.6) !important; transition: transform .1s; }
